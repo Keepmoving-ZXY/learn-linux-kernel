@@ -82,4 +82,4 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
     return false;
 ```
 
- 仅仅关注这个函数中第2个`if`代码中的内容，`READ_ONCE`防止编译器对从内存中读取task状态这个动作进行优化，读取到状态之后与指定的状态进行对比，若状态匹配则返回成功。
+ 仅仅关注这个函数中第2个`if`代码中的内容，`READ_ONCE`保证总是拿到`p->__state`字段的最近的值（相对于在CPU缓存中的值），读取到状态之后与指定的状态进行对比，若状态匹配则返回成功。
