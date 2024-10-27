@@ -421,7 +421,7 @@ void resched_curr(struct rq *rq)
 
 3.若不是同一个CPU，为rq中正在执行的任务设置被抢占标志；
 
-4.若rq所属CPU主动轮询重新调度信息，则通过`smp_send_reschedule`函数通知；
+4.若rq所属CPU不会主动轮询重新调度信息，则通过`smp_send_reschedule`函数通知；
 
 ## 待办
 
