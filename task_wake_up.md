@@ -266,7 +266,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 }
 ```
 
-忽略`CONFIG_HAVE_SCHED_AVG_IRQ`、`CONFIG_IRQ_TIME_ACCOUNTING`这两个宏启用的代码逻辑，这个函数增加了rq中任务执行占用的时间，这个时间值在某些情况下与`rq->clock`的值不一致，因为要考虑到虚拟化部分的逻辑（见`CONFIG_PARAVIRT_TIME_ACCOUNTING`宏启用的代码逻辑），随后调用`update_rq_clock_pelt`更新rq中pelt[per-entity load tracking](https://docs.kernel.org/scheduler/schedutil.html)相关的计数器。
+忽略`CONFIG_HAVE_SCHED_AVG_IRQ`、`CONFIG_IRQ_TIME_ACCOUNTING`这两个宏启用的代码逻辑，这个函数增加了rq中任务执行占用的时间，这个时间值在某些情况下与`rq->clock`的值不一致，因为要考虑到虚拟化部分的逻辑（见`CONFIG_PARAVIRT_TIME_ACCOUNTING`宏启用的代码逻辑），随后调用`update_rq_clock_pelt`更新rq中pelt（[per-entity load tracking](https://docs.kernel.org/scheduler/schedutil.html)）相关的计数器。
 
 ##### `update_rq_clock_pelt`函数
 
