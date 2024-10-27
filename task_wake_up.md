@@ -151,7 +151,7 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 
 3.尝试唤醒任务
 
-接下来重点介绍`__task_rq_lock`、`update_rq_clock`、`ttwu_do_wakeup`这三个函数。
+接下来重点关注`__task_rq_lock`、`update_rq_clock`、`ttwu_do_wakeup`这三个函数。
 
 ##### `__task_rq_lock`函数
 
@@ -213,8 +213,232 @@ void update_rq_clock(struct rq *rq)
 
 2.更新rq中其他的字段，主要在`update_rq_clock_task`函数中完成；
 
+##### `update_rq_clock_task`函数
+
+```c
+static void update_rq_clock_task(struct rq *rq, s64 delta)
+{
+/*
+ * In theory, the compile should just see 0 here, and optimize out the call
+ * to sched_rt_avg_update. But I don't trust it...
+ */
+	s64 __maybe_unused steal = 0, irq_delta = 0;
+
+#ifdef CONFIG_IRQ_TIME_ACCOUNTING
+	irq_delta = irq_time_read(cpu_of(rq)) - rq->prev_irq_time;
+
+	/*
+	 * Since irq_time is only updated on {soft,}irq_exit, we might run into
+	 * this case when a previous update_rq_clock() happened inside a
+	 * {soft,}irq region.
+	 *
+	 * When this happens, we stop ->clock_task and only update the
+	 * prev_irq_time stamp to account for the part that fit, so that a next
+	 * update will consume the rest. This ensures ->clock_task is
+	 * monotonic.
+	 *
+	 * It does however cause some slight miss-attribution of {soft,}irq
+	 * time, a more accurate solution would be to update the irq_time using
+	 * the current rq->clock timestamp, except that would require using
+	 * atomic ops.
+	 */
+	if (irq_delta > delta)
+		irq_delta = delta;
+
+	rq->prev_irq_time += irq_delta;
+	delta -= irq_delta;
+#endif
+#ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
+	if (static_key_false((&paravirt_steal_rq_enabled))) {
+		steal = paravirt_steal_clock(cpu_of(rq));
+		steal -= rq->prev_steal_time_rq;
+
+		if (unlikely(steal > delta))
+			steal = delta;
+
+		rq->prev_steal_time_rq += steal;
+		delta -= steal;
+	}
+#endif
+
+	rq->clock_task += delta;
+
+#ifdef CONFIG_HAVE_SCHED_AVG_IRQ
+	if ((irq_delta + steal) && sched_feat(NONTASK_CAPACITY))
+		update_irq_load_avg(rq, irq_delta + steal);
+#endif
+	update_rq_clock_pelt(rq, delta);
+}
 
 
-## 待办
+```
+
+忽略`CONFIG_HAVE_SCHED_AVG_IRQ`、`CONFIG_IRQ_TIME_ACCOUNTING`这两个宏启用的代码逻辑，这个函数增加了rq中任务执行占用的时间，这个时间值在某些情况下与`rq->clock`的值不一致，因为要考虑到虚拟化部分的逻辑（见`CONFIG_PARAVIRT_TIME_ACCOUNTING`宏启用的代码逻辑），随后调用`update_rq_clock_pelt`更新rq中pelt[per-entity load tracking](https://docs.kernel.org/scheduler/schedutil.html)相关的计数器。
+
+##### `update_rq_clock_pelt`函数
+
+```c
+static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
+{
+	if (unlikely(is_idle_task(rq->curr))) {
+		_update_idle_rq_clock_pelt(rq);
+		return;
+	}
+
+	/*
+	 * When a rq runs at a lower compute capacity, it will need
+	 * more time to do the same amount of work than at max
+	 * capacity. In order to be invariant, we scale the delta to
+	 * reflect how much work has been really done.
+	 * Running longer results in stealing idle time that will
+	 * disturb the load signal compared to max capacity. This
+	 * stolen idle time will be automatically reflected when the
+	 * rq will be idle and the clock will be synced with
+	 * rq_clock_task.
+	 */
+
+	/*
+	 * Scale the elapsed time to reflect the real amount of
+	 * computation
+	 */
+	delta = cap_scale(delta, arch_scale_cpu_capacity(cpu_of(rq)));
+	delta = cap_scale(delta, arch_scale_freq_capacity(cpu_of(rq)));
+
+	rq->clock_pelt += delta;
+}
+
+
+```
+
+忽略函数中对空闲任务的处理，这个函数根据CPU的capacity以及frequency对时间差（`delta`）进行缩放，将缩放结果更新到`clock_pelt`字段中。这个函数更新了pelt功能使用的字段，CPU的capacity的含义见[Capacity Aware Scheduling &#8212; The Linux Kernel documentation](https://docs.kernel.org/scheduler/sched-capacity.html)。
+
+##### `ttwu_do_wakeup`函数
+
+```c
+static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+			   struct rq_flags *rf)
+{
+	check_preempt_curr(rq, p, wake_flags);
+	WRITE_ONCE(p->__state, TASK_RUNNING);
+	trace_sched_wakeup(p);
+
+#ifdef CONFIG_SMP
+	if (p->sched_class->task_woken) {
+		/*
+		 * Our task @p is fully woken up and running; so it's safe to
+		 * drop the rq->lock, hereafter rq is only used for statistics.
+		 */
+		rq_unpin_lock(rq, rf);
+		p->sched_class->task_woken(rq, p);
+		rq_repin_lock(rq, rf);
+	}
+
+	if (rq->idle_stamp) {
+		u64 delta = rq_clock(rq) - rq->idle_stamp;
+		u64 max = 2*rq->max_idle_balance_cost;
+
+		update_avg(&rq->avg_idle, delta);
+
+		if (rq->avg_idle > max)
+			rq->avg_idle = max;
+
+		rq->wake_stamp = jiffies;
+		rq->wake_avg_idle = rq->avg_idle / 2;
+
+		rq->idle_stamp = 0;
+	}
+#endif
+}
+
+```
+
+这个函数的流程如下：
+
+1.检查当前rq中执行的任务是否可以被抢占，由`check_preempt_curr`函数实现；
+
+2.设置任务状态为`TASK_RUNNING`；
+
+3.调用调度类定义的`task_woken`实现；
+
+4.更新CPU空闲时间统计。
+
+检查rq中正在执行任务是否可以被抢占的逻辑在`check_preempt_curr`函数中详细说明，这里说明CPU空闲时间统计相关的逻辑。当rq处于空闲状态时会更新`idle_stamp`为进入空闲状态的时间戳，得到rq空闲时间之后更新rq的平均空闲时间，这个空闲时间是计算方式如下代码所示：
+
+```c
+static inline void update_avg(u64 *avg, u64 sample)
+{
+	s64 diff = sample - *avg;
+	*avg += diff / 8;
+}
+
+```
+
+为了防止平均空闲时间过长导致调度器一直向这个CPU中调度新的任务，需要限制rq的平均空闲时间最大值为`max_idle_balance_cost`的2倍。更新rq的平均空闲时间的同时也更新了`wake_stamp`、`wake_avg_idle`字段的值，这些字段都在调度器进行负载均衡过程中使用，例如某些CPU处于比较繁忙的状态而另外一些CPU处于空闲状态，就可以将忙碌CPU的rq中任务调度到空闲CPU中执行。
+
+##### `check_preempt_curr`函数
+
+```c
+void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
+{
+	if (p->sched_class == rq->curr->sched_class)
+		rq->curr->sched_class->check_preempt_curr(rq, p, flags);
+	else if (sched_class_above(p->sched_class, rq->curr->sched_class))
+		resched_curr(rq);
+
+	/*
+	 * A queue event has occurred, and we're going to schedule.  In
+	 * this case, we can save a useless back to back clock update.
+	 */
+	if (task_on_rq_queued(rq->curr) && test_tsk_need_resched(rq->curr))
+		rq_clock_skip_update(rq);
+}
+
+```
+
+若被唤醒的任务与rq中正在执行的任务使用同一个调度类（比如都是用CFS），则调用调度类自己定义的`check_preempt_curr`函数进行抢占检查；若使用不同的调度类，若被唤醒进程的调度类优先级比rq中正在运行的task使用的调度类高，则添加抢占正在运行的任务相关标识（`resched_curr`函数，下边详细介绍它的流程）。当rq中正在运行的任务在rq中并且它将会被抢占，这说明马上要进行任务调度，使用`rq_clock_skip_update`跳过在执行抢占过程中调度器时间相关字段更新。
+
+##### `resched_curr`函数
+
+```c
+void resched_curr(struct rq *rq)
+{
+	struct task_struct *curr = rq->curr;
+	int cpu;
+
+	lockdep_assert_rq_held(rq);
+
+	if (test_tsk_need_resched(curr))
+		return;
+
+	cpu = cpu_of(rq);
+
+	if (cpu == smp_processor_id()) {
+		set_tsk_need_resched(curr);
+		set_preempt_need_resched();
+		return;
+	}
+
+	if (set_nr_and_not_polling(curr))
+		smp_send_reschedule(cpu);
+	else
+		trace_sched_wake_idle_without_ipi(cpu);
+}
+
+
+```
+
+忽略`lockdep_assert_rq_held`函数，这个函数的整体流程如下：
+
+1.若rq中正在执行的任务设置了被抢占的标志，则推出函数；
+
+2.若被唤醒任务所在的rq所属的CPU与当前CPU是同一个CPU，则设置两个标志然后退出；
+
+3.若不是同一个CPU，为rq中正在执行的任务设置被抢占标志；
+
+4.若rq所属CPU主动轮询重新调度信息，则通过`smp_send_reschedule`函数通知；
+
+
+
+## 待办https://docs.kernel.org/scheduler/schedutil.html
 
 - [ ] 整理任务`pi_lock`的作用；
