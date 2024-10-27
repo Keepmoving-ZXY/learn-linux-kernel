@@ -90,7 +90,7 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
 
 #### 2.1.任务状态检查
 
-这种情况下首先调用`ttwu_state_match`函数进行状态检查，如果状态不匹配则跳转到`out`标签，在调用这个函数之前需要持有`pi_lock`锁、禁用当前CPU的中断、保存中断状态（仅在这个这个函数中很难看到`pi_lock`的作用，需要结合更多进程调度源码进行分析），代码如下：
+这种情况下首先调用`ttwu_state_match`函数进行状态检查，如果状态不匹配则跳转到`unlock`标签，在调用这个函数之前需要持有`pi_lock`锁、禁用当前CPU的中断、保存中断状态（仅在这个这个函数中很难看到`pi_lock`的作用，需要结合更多进程调度源码进行分析），代码如下：
 
 ```c
     /*
@@ -107,7 +107,7 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
     trace_sched_waking(p);
 ```
 
-#### 2.2.尝试唤醒任务
+#### 2.2.唤醒任务
 
 ```c
     smp_rmb();
@@ -115,9 +115,22 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
         goto unlock;
 ```
 
-使用`smp_rmb`防止读操作乱序，以此来保证`p->on_rq`对应的读取操作不会被提前，真正执行任务唤醒的流程在`ttwu_runnable`函数中。
+使用`smp_rmb`防止读操作乱序，以此来保证`p->on_rq`对应的读取操作不会被提前，真正执行任务唤醒的流程在`ttwu_runnable`函数中。若`ttwu_runnable`返回为1则task唤醒成功，跳转到`unlock`执行。
 
 ##### `ttwu_runnable`函数
+
+该函数的内部函数调用拓扑如下所示：
+
+```
+ttwu_runnable:
+    __task_rq_lock
+    update_rq_clock
+        update_rq_clock_task
+            update_rq_clock_pelt
+    ttwu_do_wakeup
+        check_preempt_curr
+            resched_curr
+```
 
 ```c
 static int ttwu_runnable(struct task_struct *p, int wake_flags)
@@ -138,6 +151,8 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
     return ret;
 }
 ```
+
+
 
 这个函数的流程如下：
 
@@ -422,6 +437,16 @@ void resched_curr(struct rq *rq)
 3.若不是同一个CPU，为rq中正在执行的任务设置被抢占标志；
 
 4.若rq所属CPU不会主动轮询重新调度信息，则通过`smp_send_reschedule`函数通知；
+
+#### 2.3. 任务放入wake list
+
+```c
+	if (smp_load_acquire(&p->on_cpu) &&
+	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
+		goto unlock;
+```
+
+当被唤醒的任务还在处于另外一个CPU把它调出的过程中时，它的`on_cpu`字段不为0，此时想把它放到其他的CPU中执行，这个时候需要把这个任务放到即将执行任务的CPU的wake list，然后通过IPI中断通知执行这个任务的CPU继续进行处理。这个逻辑主要由`ttwu_queue_wakelist` 函数实现。
 
 ## 待办
 
