@@ -441,9 +441,9 @@ void resched_curr(struct rq *rq)
 #### 2.3. 任务放入wake list
 
 ```c
-	if (smp_load_acquire(&p->on_cpu) &&
-	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
-		goto unlock;
+if (smp_load_acquire(&p->on_cpu) &&
+	ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
+	goto unlock;
 ```
 
 当被唤醒的任务还在处于另外一个CPU把它调出的过程中时，它的`on_cpu`字段不为0，此时想把它放到其他的CPU中执行，这个时候需要把这个任务放到即将执行任务的CPU的wake list，然后通过IPI中断通知执行这个任务的CPU继续进行处理。这个逻辑主要由`ttwu_queue_wakelist` 函数实现。
