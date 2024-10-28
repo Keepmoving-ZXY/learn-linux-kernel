@@ -152,8 +152,6 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 }
 ```
 
-
-
 这个函数的流程如下：
 
 1.获取task所在rq的锁，这个锁是一个自旋锁；
@@ -441,12 +439,56 @@ void resched_curr(struct rq *rq)
 #### 2.3. 任务放入wake list
 
 ```c
-if (smp_load_acquire(&p->on_cpu) &&
-	ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
-	goto unlock;
+	if (smp_load_acquire(&p->on_cpu) &&
+	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
+		goto unlock;
+
 ```
 
 当被唤醒的任务还在处于另外一个CPU把它调出的过程中时，它的`on_cpu`字段不为0，此时想把它放到其他的CPU中执行，这个时候需要把这个任务放到即将执行任务的CPU的wake list，然后通过IPI中断通知执行这个任务的CPU继续进行处理。这个逻辑主要由`ttwu_queue_wakelist` 函数实现。
+
+##### `ttwu_queue_wakelist`函数
+
+```c
+static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+{
+	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(p, cpu)) {
+		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
+		__ttwu_queue_wakelist(p, cpu, wake_flags);
+		return true;
+	}
+
+	return false;
+}
+```
+
+若定义了`CONFIG_HAVE_UNSTABLE_SCHED_CLOCK`宏，`sched_clock_cpu`才会进行时间同步操作，否则这个这个函数仅仅是返回了一下当前的时间并且函数参数没有任何意义。这里仅关注`CONFIG_HAVE_UNSTABLE_SCHED_LOCK`宏未定义的情况，此时`sched_clock_cpu`调用的是`native_sched_clock`函数，这个函数仅仅返回了当前的时间（以纳秒为单位）。接下来关注`__ttwu_queue_wakelist`函数。
+
+##### `__ttwu_queue_wakelist`函数
+
+```c
+static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+{
+	struct rq *rq = cpu_rq(cpu);
+
+	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+
+	WRITE_ONCE(rq->ttwu_pending, 1);
+	__smp_call_single_queue(cpu, &p->wake_entry.llist);
+}
+```
+
+函数流程如下：
+
+1.更新`sched_remote_wakeup`字段，这个字段为1表示任务需要在CPU之间进行转移；
+
+2.更新`ttwu_pending`字段的值为1，使用`WRITE_ONCE`保证缓存一致性；
+
+3.调用`__smp_call_single_queue`函数向`cpu`参数指定的CPU触发IPI中断，通知这个CPU处理任务唤醒请求；
+
+`__smp_call_single_queue`函数将被唤醒的任务加入到`cpu`参数执行的CPU中的队列中（`call_single_queue`，为per-cpu变量），若这个队列在新的任务添加之前为空则向它发送IPI中断。这里注意到当这个队列在添加之前不为空时不需要发送IPI中断，这是因为这种情况下CPU正在处理队列中的内容，无需主动通知。
+
+
 
 ## 待办
 
