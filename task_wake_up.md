@@ -439,11 +439,15 @@ void resched_curr(struct rq *rq)
 #### 2.3. 任务放入wake list
 
 ```c
-	if (smp_load_acquire(&p->on_cpu) &&
-	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
-		goto unlock;
-
+    smp_acquire__after_ctrl_dep();
+    WRITE_ONCE(p->__state, TASK_WAKING);
+   
+    if (smp_load_acquire(&p->on_cpu) &&
+        ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
+        goto unlock;
 ```
+
+`smp_acquire__after_ctrl_dep`保证先加载`p->on_rq`随后加载`p->on_cpu`，这两个字段的加载的顺序不会与代码中的顺序相反。随后将任务的状态设置为`TASK_WAKING`，这里使用了`WRITE_ONCE`来保证缓存一致性。
 
 当被唤醒的任务还在处于另外一个CPU把它调出的过程中时，它的`on_cpu`字段不为0，此时想把它放到其他的CPU中执行，这个时候需要把这个任务放到即将执行任务的CPU的wake list，然后通过IPI中断通知执行这个任务的CPU继续进行处理。这个逻辑主要由`ttwu_queue_wakelist` 函数实现。
 
@@ -452,13 +456,13 @@ void resched_curr(struct rq *rq)
 ```c
 static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 {
-	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(p, cpu)) {
-		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
-		__ttwu_queue_wakelist(p, cpu, wake_flags);
-		return true;
-	}
+    if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(p, cpu)) {
+        sched_clock_cpu(cpu); /* Sync clocks across CPUs */
+        __ttwu_queue_wakelist(p, cpu, wake_flags);
+        return true;
+    }
 
-	return false;
+    return false;
 }
 ```
 
@@ -469,12 +473,12 @@ static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 ```c
 static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 {
-	struct rq *rq = cpu_rq(cpu);
+    struct rq *rq = cpu_rq(cpu);
 
-	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+    p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
 
-	WRITE_ONCE(rq->ttwu_pending, 1);
-	__smp_call_single_queue(cpu, &p->wake_entry.llist);
+    WRITE_ONCE(rq->ttwu_pending, 1);
+    __smp_call_single_queue(cpu, &p->wake_entry.llist);
 }
 ```
 
@@ -487,8 +491,6 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
 3.调用`__smp_call_single_queue`函数向`cpu`参数指定的CPU触发IPI中断，通知这个CPU处理任务唤醒请求；
 
 `__smp_call_single_queue`函数将被唤醒的任务加入到`cpu`参数执行的CPU中的队列中（`call_single_queue`，为per-cpu变量），若这个队列在新的任务添加之前为空则向它发送IPI中断。这里注意到当这个队列在添加之前不为空时不需要发送IPI中断，这是因为这种情况下CPU正在处理队列中的内容，无需主动通知。
-
-
 
 ## 待办
 
