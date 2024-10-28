@@ -441,7 +441,7 @@ void resched_curr(struct rq *rq)
 ```c
     smp_acquire__after_ctrl_dep();
     WRITE_ONCE(p->__state, TASK_WAKING);
-   
+
     if (smp_load_acquire(&p->on_cpu) &&
         ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
         goto unlock;
@@ -491,6 +491,75 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
 3.调用`__smp_call_single_queue`函数向`cpu`参数指定的CPU触发IPI中断，通知这个CPU处理任务唤醒请求；
 
 `__smp_call_single_queue`函数将被唤醒的任务加入到`cpu`参数执行的CPU中的队列中（`call_single_queue`，为per-cpu变量），若这个队列在新的任务添加之前为空则向它发送IPI中断。这里注意到当这个队列在添加之前不为空时不需要发送IPI中断，这是因为这种情况下CPU正在处理队列中的内容，无需主动通知。
+
+#### 2.4.寻找新的CPU运行任务
+
+```c
+	/*
+	 * If the owning (remote) CPU is still in the middle of schedule() with
+	 * this task as prev, wait until it's done referencing the task.
+	 *
+	 * Pairs with the smp_store_release() in finish_task().
+	 *
+	 * This ensures that tasks getting woken will be fully ordered against
+	 * their previous state and preserve Program Order.
+	 */
+	smp_cond_load_acquire(&p->on_cpu, !VAL);
+
+	cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
+	if (task_cpu(p) != cpu) {
+		if (p->in_iowait) {
+			delayacct_blkio_end(p);
+			atomic_dec(&task_rq(p)->nr_iowait);
+		}
+
+		wake_flags |= WF_MIGRATED;
+		psi_ttwu_dequeue(p);
+		set_task_cpu(p, cpu);
+	}
+
+```
+
+`smp_cond_load_acquire`等待task的`on_cpu`为0，并且保证在这行代码之前的内存操作都不会在这行代码之后执行，`2.3`中解释了在什么情况下`on_cpu`字段的值不为0。
+
+`select_task_rq`为被唤醒的任务选择一个CPU执行，当选中的CPU与任务指定的CPU不是同一个时为`wake_flags`添加`WF_MIGRATED`标识、调用`set_task_cpu`执行更新逻辑，忽略`p->in_iowait`中的逻辑以及`psi_ttwu_queue`函数。
+
+接下来重点关注`select_task_rq`以及`set_task_cpu`中的逻辑。
+
+##### `select_task_rq`函数
+
+```c
+static inline
+int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
+{
+	lockdep_assert_held(&p->pi_lock);
+
+	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
+		cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
+	else
+		cpu = cpumask_any(p->cpus_ptr);
+
+	/*
+	 * In order not to call set_task_cpu() on a blocking task we need
+	 * to rely on ttwu() to place the task on a valid ->cpus_ptr
+	 * CPU.
+	 *
+	 * Since this is common to all placement strategies, this lives here.
+	 *
+	 * [ this allows ->select_task() to simply return task_cpu(p) and
+	 *   not worry about this generic constraint ]
+	 */
+	if (unlikely(!is_cpu_allowed(p, cpu)))
+		cpu = select_fallback_rq(task_cpu(p), p);
+
+	return cpu;
+}
+
+```
+
+若任务允许运行的CPU数量大于1、允许任务在CPU之间转移，调用调度类定义的`select_task_rq`返回一个CPU用于运行任务；反之则从任务允许执行的CPU中选择一个CPU运行任务。在选择一个CPU之后需要判断是否允许使用被选中的CPU，如果不允许则调用`select_fallback_rq`函数重新选择可以运行任务的CPU。
+
+
 
 ## 待办
 
