@@ -495,29 +495,28 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
 #### 2.4.寻找新的CPU运行任务
 
 ```c
-	/*
-	 * If the owning (remote) CPU is still in the middle of schedule() with
-	 * this task as prev, wait until it's done referencing the task.
-	 *
-	 * Pairs with the smp_store_release() in finish_task().
-	 *
-	 * This ensures that tasks getting woken will be fully ordered against
-	 * their previous state and preserve Program Order.
-	 */
-	smp_cond_load_acquire(&p->on_cpu, !VAL);
+    /*
+     * If the owning (remote) CPU is still in the middle of schedule() with
+     * this task as prev, wait until it's done referencing the task.
+     *
+     * Pairs with the smp_store_release() in finish_task().
+     *
+     * This ensures that tasks getting woken will be fully ordered against
+     * their previous state and preserve Program Order.
+     */
+    smp_cond_load_acquire(&p->on_cpu, !VAL);
 
-	cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
-	if (task_cpu(p) != cpu) {
-		if (p->in_iowait) {
-			delayacct_blkio_end(p);
-			atomic_dec(&task_rq(p)->nr_iowait);
-		}
+    cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
+    if (task_cpu(p) != cpu) {
+        if (p->in_iowait) {
+            delayacct_blkio_end(p);
+            atomic_dec(&task_rq(p)->nr_iowait);
+        }
 
-		wake_flags |= WF_MIGRATED;
-		psi_ttwu_dequeue(p);
-		set_task_cpu(p, cpu);
-	}
-
+        wake_flags |= WF_MIGRATED;
+        psi_ttwu_dequeue(p);
+        set_task_cpu(p, cpu);
+    }
 ```
 
 `smp_cond_load_acquire`等待task的`on_cpu`为0，并且保证在这行代码之前的内存操作都不会在这行代码之后执行，`2.3`中解释了在什么情况下`on_cpu`字段的值不为0。
@@ -532,34 +531,200 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
 static inline
 int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
 {
-	lockdep_assert_held(&p->pi_lock);
+    lockdep_assert_held(&p->pi_lock);
 
-	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
-		cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
-	else
-		cpu = cpumask_any(p->cpus_ptr);
+    if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
+        cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
+    else
+        cpu = cpumask_any(p->cpus_ptr);
 
-	/*
-	 * In order not to call set_task_cpu() on a blocking task we need
-	 * to rely on ttwu() to place the task on a valid ->cpus_ptr
-	 * CPU.
-	 *
-	 * Since this is common to all placement strategies, this lives here.
-	 *
-	 * [ this allows ->select_task() to simply return task_cpu(p) and
-	 *   not worry about this generic constraint ]
-	 */
-	if (unlikely(!is_cpu_allowed(p, cpu)))
-		cpu = select_fallback_rq(task_cpu(p), p);
+    /*
+     * In order not to call set_task_cpu() on a blocking task we need
+     * to rely on ttwu() to place the task on a valid ->cpus_ptr
+     * CPU.
+     *
+     * Since this is common to all placement strategies, this lives here.
+     *
+     * [ this allows ->select_task() to simply return task_cpu(p) and
+     *   not worry about this generic constraint ]
+     */
+    if (unlikely(!is_cpu_allowed(p, cpu)))
+        cpu = select_fallback_rq(task_cpu(p), p);
 
-	return cpu;
+    return cpu;
 }
-
 ```
 
 若任务允许运行的CPU数量大于1、允许任务在CPU之间转移，调用调度类定义的`select_task_rq`返回一个CPU用于运行任务；反之则从任务允许执行的CPU中选择一个CPU运行任务。在选择一个CPU之后需要判断是否允许使用被选中的CPU，如果不允许则调用`select_fallback_rq`函数重新选择可以运行任务的CPU。
 
+接下来重点关注`is_cpu_allowed`以及`select_fallback_rq`函数。
 
+##### `is_cpu_allowed`函数
+
+```c
+static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
+{
+	/* When not in the task's cpumask, no point in looking further. */
+	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+		return false;
+
+	/* migrate_disabled() must be allowed to finish. */
+	if (is_migration_disabled(p))
+		return cpu_online(cpu);
+
+	/* Non kernel threads are not allowed during either online or offline. */
+	if (!(p->flags & PF_KTHREAD))
+		return cpu_active(cpu) && task_cpu_possible(cpu, p);
+
+	/* KTHREAD_IS_PER_CPU is always allowed. */
+	if (kthread_is_per_cpu(p))
+		return cpu_online(cpu);
+
+	/* Regular kernel threads don't get to stay during offline. */
+	if (cpu_dying(cpu))
+		return false;
+
+	/* But are allowed during online. */
+	return cpu_online(cpu);
+}
+
+```
+
+`cpu_online`的含义为CPU是否处于可用状态，`cpu_active`的含义为CPU是否可以接受任务调度，`cpu_dying`的含义为CPU是否正在下线。注意CPU在可用状态下不一定意味着CPU可以用接受任务调度，CPU状态含义以及转换转换逻辑参加内核相关源码。
+
+这个函数主要用于检查CPU是否可用，从如下几个方面进行检查：
+
+1.CPU是否在允许的CPU之中；
+
+2.若任务不允许转移，则返回CPU是否处于可用状态；
+
+3.若任务是一个内核线程，返回CPU是否可以接受任务调度并且任务可以运行在这个CPU之中；
+
+4.若任务是在CPU中运行的内核线程（每个CPU上都运行一个内核线程），则返回CPU是否可用状态；
+
+5.若CPU正在下线过程中则返回False；
+
+6.返回CPU是否处于可用状态；
+
+##### `select_fallback_rq`函数
+
+```c
+static int select_fallback_rq(int cpu, struct task_struct *p)
+{
+	int nid = cpu_to_node(cpu);
+	const struct cpumask *nodemask = NULL;
+	enum { cpuset, possible, fail } state = cpuset;
+	int dest_cpu;
+
+	/*
+	 * If the node that the CPU is on has been offlined, cpu_to_node()
+	 * will return -1. There is no CPU on the node, and we should
+	 * select the CPU on the other node.
+	 */
+	if (nid != -1) {
+		nodemask = cpumask_of_node(nid);
+
+		/* Look for allowed, online CPU in same node. */
+		for_each_cpu(dest_cpu, nodemask) {
+			if (is_cpu_allowed(p, dest_cpu))
+				return dest_cpu;
+		}
+	}
+
+	for (;;) {
+		/* Any allowed, online CPU? */
+		for_each_cpu(dest_cpu, p->cpus_ptr) {
+			if (!is_cpu_allowed(p, dest_cpu))
+				continue;
+
+			goto out;
+		}
+
+		/* No more Mr. Nice Guy. */
+		switch (state) {
+		case cpuset:
+			if (cpuset_cpus_allowed_fallback(p)) {
+				state = possible;
+				break;
+			}
+			fallthrough;
+		case possible:
+			/*
+			 * XXX When called from select_task_rq() we only
+			 * hold p->pi_lock and again violate locking order.
+			 *
+			 * More yuck to audit.
+			 */
+			do_set_cpus_allowed(p, task_cpu_possible_mask(p));
+			state = fail;
+			break;
+		case fail:
+			BUG();
+			break;
+		}
+	}
+
+out:
+	if (state != cpuset) {
+		/*
+		 * Don't tell them about moving exiting tasks or
+		 * kernel threads (both mm NULL), since they never
+		 * leave kernel.
+		 */
+		if (p->mm && printk_ratelimit()) {
+			printk_deferred("process %d (%s) no longer affine to cpu%d\n",
+					task_pid_nr(p), p->comm, cpu);
+		}
+	}
+
+	return dest_cpu;
+}
+```
+
+当CPU所在的numa节点在线时，尝试从这个numa节点中选出另外一个可用的CPU，若无法选出一个可用的CPU进入`for`循环之中。在这个循环之中首先尝试从任务允许的CPU之中选出一个可用的CPU，若无法找到这样的CPU则考虑从cgroup中的cpuset中寻找一个可用的CPU，对应的逻辑在`cpuset_cpus_allowed_fallback`之中，无论有没有从cpuset中找到合适的CPU，都要执行`__do_set_cpus_allowed`函数。当任务作为一个进程并且这个任务无法调度到指定的CPU中运行时，打印日志随后返回。
+
+接下来关注`cpuset_cpus_allowed_fallback`、`__do_set_cpus_allowed`这两个函数中的内容。
+
+##### `cpuset_cpus_allowed_fallback`函数
+
+```c
+bool cpuset_cpus_allowed_fallback(struct task_struct *tsk)
+{
+	const struct cpumask *possible_mask = task_cpu_possible_mask(tsk);
+	const struct cpumask *cs_mask;
+	bool changed = false;
+
+	rcu_read_lock();
+	cs_mask = task_cs(tsk)->cpus_allowed;
+	if (is_in_v2_mode() && cpumask_subset(cs_mask, possible_mask)) {
+		do_set_cpus_allowed(tsk, cs_mask);
+		changed = true;
+	}
+	rcu_read_unlock();
+
+	/*
+	 * We own tsk->cpus_allowed, nobody can change it under us.
+	 *
+	 * But we used cs && cs->cpus_allowed lockless and thus can
+	 * race with cgroup_attach_task() or update_cpumask() and get
+	 * the wrong tsk->cpus_allowed. However, both cases imply the
+	 * subsequent cpuset_change_cpumask()->set_cpus_allowed_ptr()
+	 * which takes task_rq_lock().
+	 *
+	 * If we are called after it dropped the lock we must see all
+	 * changes in tsk_cs()->cpus_allowed. Otherwise we can temporary
+	 * set any mask even if it is not right from task_cs() pov,
+	 * the pending set_cpus_allowed_ptr() will fix things.
+	 *
+	 * select_fallback_rq() will fix things ups and set cpu_possible_mask
+	 * if required.
+	 */
+	return changed;
+}
+
+```
+
+`task_cpu_possible_mask`返回系统中所有可能可用的CPU，`cs_mask`为cgroup cpuset中的所有可用的CPU，若cpuset中的CPU为系统可能可用的CPU中的一个子集，那么调用`do_set_cpus_allowed`函数修改任务允许使用的CPU。`do_set_cpus_allowed`函数中调用了任务使用的调度类定义的诸多方法，这个函数调用了`__do_set_cpus_allowed`函数并将第三个参数设置为0，下面关注`__do_set_cpus_allowed`这个函数。
 
 ## 待办
 
