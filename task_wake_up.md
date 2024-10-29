@@ -428,7 +428,7 @@ void resched_curr(struct rq *rq)
 
 忽略`lockdep_assert_rq_held`、`trace_sched_wake_idle_without_ipi`函数，这个函数的整体流程如下：
 
-1.若rq中正在执行的任务设置了被抢占的标志，则推出函数；
+1.若rq中正在执行的任务设置了被抢占的标志，则退出函数；
 
 2.若被唤醒任务所在的rq所属的CPU与当前CPU是同一个CPU，则设置两个标志然后退出；
 
@@ -564,30 +564,29 @@ int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
 ```c
 static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 {
-	/* When not in the task's cpumask, no point in looking further. */
-	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
-		return false;
+    /* When not in the task's cpumask, no point in looking further. */
+    if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+        return false;
 
-	/* migrate_disabled() must be allowed to finish. */
-	if (is_migration_disabled(p))
-		return cpu_online(cpu);
+    /* migrate_disabled() must be allowed to finish. */
+    if (is_migration_disabled(p))
+        return cpu_online(cpu);
 
-	/* Non kernel threads are not allowed during either online or offline. */
-	if (!(p->flags & PF_KTHREAD))
-		return cpu_active(cpu) && task_cpu_possible(cpu, p);
+    /* Non kernel threads are not allowed during either online or offline. */
+    if (!(p->flags & PF_KTHREAD))
+        return cpu_active(cpu) && task_cpu_possible(cpu, p);
 
-	/* KTHREAD_IS_PER_CPU is always allowed. */
-	if (kthread_is_per_cpu(p))
-		return cpu_online(cpu);
+    /* KTHREAD_IS_PER_CPU is always allowed. */
+    if (kthread_is_per_cpu(p))
+        return cpu_online(cpu);
 
-	/* Regular kernel threads don't get to stay during offline. */
-	if (cpu_dying(cpu))
-		return false;
+    /* Regular kernel threads don't get to stay during offline. */
+    if (cpu_dying(cpu))
+        return false;
 
-	/* But are allowed during online. */
-	return cpu_online(cpu);
+    /* But are allowed during online. */
+    return cpu_online(cpu);
 }
-
 ```
 
 `cpu_online`的含义为CPU是否处于可用状态，`cpu_active`的含义为CPU是否可以接受任务调度，`cpu_dying`的含义为CPU是否正在下线。注意CPU在可用状态下不一定意味着CPU可以用接受任务调度，CPU状态含义以及转换转换逻辑参加内核相关源码。
@@ -611,73 +610,73 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 ```c
 static int select_fallback_rq(int cpu, struct task_struct *p)
 {
-	int nid = cpu_to_node(cpu);
-	const struct cpumask *nodemask = NULL;
-	enum { cpuset, possible, fail } state = cpuset;
-	int dest_cpu;
+    int nid = cpu_to_node(cpu);
+    const struct cpumask *nodemask = NULL;
+    enum { cpuset, possible, fail } state = cpuset;
+    int dest_cpu;
 
-	/*
-	 * If the node that the CPU is on has been offlined, cpu_to_node()
-	 * will return -1. There is no CPU on the node, and we should
-	 * select the CPU on the other node.
-	 */
-	if (nid != -1) {
-		nodemask = cpumask_of_node(nid);
+    /*
+     * If the node that the CPU is on has been offlined, cpu_to_node()
+     * will return -1. There is no CPU on the node, and we should
+     * select the CPU on the other node.
+     */
+    if (nid != -1) {
+        nodemask = cpumask_of_node(nid);
 
-		/* Look for allowed, online CPU in same node. */
-		for_each_cpu(dest_cpu, nodemask) {
-			if (is_cpu_allowed(p, dest_cpu))
-				return dest_cpu;
-		}
-	}
+        /* Look for allowed, online CPU in same node. */
+        for_each_cpu(dest_cpu, nodemask) {
+            if (is_cpu_allowed(p, dest_cpu))
+                return dest_cpu;
+        }
+    }
 
-	for (;;) {
-		/* Any allowed, online CPU? */
-		for_each_cpu(dest_cpu, p->cpus_ptr) {
-			if (!is_cpu_allowed(p, dest_cpu))
-				continue;
+    for (;;) {
+        /* Any allowed, online CPU? */
+        for_each_cpu(dest_cpu, p->cpus_ptr) {
+            if (!is_cpu_allowed(p, dest_cpu))
+                continue;
 
-			goto out;
-		}
+            goto out;
+        }
 
-		/* No more Mr. Nice Guy. */
-		switch (state) {
-		case cpuset:
-			if (cpuset_cpus_allowed_fallback(p)) {
-				state = possible;
-				break;
-			}
-			fallthrough;
-		case possible:
-			/*
-			 * XXX When called from select_task_rq() we only
-			 * hold p->pi_lock and again violate locking order.
-			 *
-			 * More yuck to audit.
-			 */
-			do_set_cpus_allowed(p, task_cpu_possible_mask(p));
-			state = fail;
-			break;
-		case fail:
-			BUG();
-			break;
-		}
-	}
+        /* No more Mr. Nice Guy. */
+        switch (state) {
+        case cpuset:
+            if (cpuset_cpus_allowed_fallback(p)) {
+                state = possible;
+                break;
+            }
+            fallthrough;
+        case possible:
+            /*
+             * XXX When called from select_task_rq() we only
+             * hold p->pi_lock and again violate locking order.
+             *
+             * More yuck to audit.
+             */
+            do_set_cpus_allowed(p, task_cpu_possible_mask(p));
+            state = fail;
+            break;
+        case fail:
+            BUG();
+            break;
+        }
+    }
 
 out:
-	if (state != cpuset) {
-		/*
-		 * Don't tell them about moving exiting tasks or
-		 * kernel threads (both mm NULL), since they never
-		 * leave kernel.
-		 */
-		if (p->mm && printk_ratelimit()) {
-			printk_deferred("process %d (%s) no longer affine to cpu%d\n",
-					task_pid_nr(p), p->comm, cpu);
-		}
-	}
+    if (state != cpuset) {
+        /*
+         * Don't tell them about moving exiting tasks or
+         * kernel threads (both mm NULL), since they never
+         * leave kernel.
+         */
+        if (p->mm && printk_ratelimit()) {
+            printk_deferred("process %d (%s) no longer affine to cpu%d\n",
+                    task_pid_nr(p), p->comm, cpu);
+        }
+    }
 
-	return dest_cpu;
+    return dest_cpu;
 }
 ```
 
@@ -690,41 +689,188 @@ out:
 ```c
 bool cpuset_cpus_allowed_fallback(struct task_struct *tsk)
 {
-	const struct cpumask *possible_mask = task_cpu_possible_mask(tsk);
-	const struct cpumask *cs_mask;
-	bool changed = false;
+    const struct cpumask *possible_mask = task_cpu_possible_mask(tsk);
+    const struct cpumask *cs_mask;
+    bool changed = false;
 
-	rcu_read_lock();
-	cs_mask = task_cs(tsk)->cpus_allowed;
-	if (is_in_v2_mode() && cpumask_subset(cs_mask, possible_mask)) {
-		do_set_cpus_allowed(tsk, cs_mask);
-		changed = true;
-	}
-	rcu_read_unlock();
+    rcu_read_lock();
+    cs_mask = task_cs(tsk)->cpus_allowed;
+    if (is_in_v2_mode() && cpumask_subset(cs_mask, possible_mask)) {
+        do_set_cpus_allowed(tsk, cs_mask);
+        changed = true;
+    }
+    rcu_read_unlock();
 
-	/*
-	 * We own tsk->cpus_allowed, nobody can change it under us.
-	 *
-	 * But we used cs && cs->cpus_allowed lockless and thus can
-	 * race with cgroup_attach_task() or update_cpumask() and get
-	 * the wrong tsk->cpus_allowed. However, both cases imply the
-	 * subsequent cpuset_change_cpumask()->set_cpus_allowed_ptr()
-	 * which takes task_rq_lock().
-	 *
-	 * If we are called after it dropped the lock we must see all
-	 * changes in tsk_cs()->cpus_allowed. Otherwise we can temporary
-	 * set any mask even if it is not right from task_cs() pov,
-	 * the pending set_cpus_allowed_ptr() will fix things.
-	 *
-	 * select_fallback_rq() will fix things ups and set cpu_possible_mask
-	 * if required.
-	 */
-	return changed;
+    /*
+     * We own tsk->cpus_allowed, nobody can change it under us.
+     *
+     * But we used cs && cs->cpus_allowed lockless and thus can
+     * race with cgroup_attach_task() or update_cpumask() and get
+     * the wrong tsk->cpus_allowed. However, both cases imply the
+     * subsequent cpuset_change_cpumask()->set_cpus_allowed_ptr()
+     * which takes task_rq_lock().
+     *
+     * If we are called after it dropped the lock we must see all
+     * changes in tsk_cs()->cpus_allowed. Otherwise we can temporary
+     * set any mask even if it is not right from task_cs() pov,
+     * the pending set_cpus_allowed_ptr() will fix things.
+     *
+     * select_fallback_rq() will fix things ups and set cpu_possible_mask
+     * if required.
+     */
+    return changed;
 }
-
 ```
 
 `task_cpu_possible_mask`返回系统中所有可能可用的CPU，`cs_mask`为cgroup cpuset中的所有可用的CPU，若cpuset中的CPU为系统可能可用的CPU中的一个子集，那么调用`do_set_cpus_allowed`函数修改任务允许使用的CPU。`do_set_cpus_allowed`函数中调用了任务使用的调度类定义的诸多方法，这个函数调用了`__do_set_cpus_allowed`函数并将第三个参数设置为0，下面关注`__do_set_cpus_allowed`这个函数。
+
+##### `__do_set_cpus_allowed`函数
+
+```c
+static void
+__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
+{
+	struct rq *rq = task_rq(p);
+	bool queued, running;
+
+	/*
+	 * This here violates the locking rules for affinity, since we're only
+	 * supposed to change these variables while holding both rq->lock and
+	 * p->pi_lock.
+	 *
+	 * HOWEVER, it magically works, because ttwu() is the only code that
+	 * accesses these variables under p->pi_lock and only does so after
+	 * smp_cond_load_acquire(&p->on_cpu, !VAL), and we're in __schedule()
+	 * before finish_task().
+	 *
+	 * XXX do further audits, this smells like something putrid.
+	 */
+	if (flags & SCA_MIGRATE_DISABLE)
+		SCHED_WARN_ON(!p->on_cpu);
+	else
+		lockdep_assert_held(&p->pi_lock);
+
+	queued = task_on_rq_queued(p);
+	running = task_current(rq, p);
+
+	if (queued) {
+		/*
+		 * Because __kthread_bind() calls this on blocked tasks without
+		 * holding rq->lock.
+		 */
+		lockdep_assert_rq_held(rq);
+		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
+	}
+	if (running)
+		put_prev_task(rq, p);
+
+	p->sched_class->set_cpus_allowed(p, new_mask, flags);
+
+	if (queued)
+		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
+	if (running)
+		set_next_task(rq, p);
+}
+```
+
+忽略代码中`lockdep_assert_held`、`lockdep_assert_rq_held`函数，若禁止了任务在CPU之间转移并且当任务不在任何CPU中时会产生一条警告日志。若任务在某个rq之中，则先后执行`dequeue_task`、`enqueue_task`函数，若任务为当前rq中正在运行的任务则先后执行`put_prev_task`以及`set_next_task`函数。当这个任务正在rq队列之中时，这个修改会影响调度过程中的许多细节，因此需要将任务从rq中出队然后入；当这个任务为正在运行的任务时，修改任务可以使用的CPU会影响调度类中的许多细节，因此需要先执行调度器特有的`put_prev_task`以及`set_next_task`以实现先将任务放到调度类的就绪队列、执行队列之中。接下来关注这4个函数。
+
+##### `dequeue_task`函数
+
+```c
+static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+{
+	if (sched_core_enabled(rq))
+		sched_core_dequeue(rq, p, flags);
+
+	if (!(flags & DEQUEUE_NOCLOCK))
+		update_rq_clock(rq);
+
+	if (!(flags & DEQUEUE_SAVE)) {
+		sched_info_dequeue(rq, p);
+		psi_dequeue(p, flags & DEQUEUE_SLEEP);
+	}
+
+	uclamp_rq_dec(rq, p);
+	p->sched_class->dequeue_task(rq, p, flags);
+}
+```
+
+
+
+这个函数会调用调度类的`dequeue_task`方法，若未指定`DEQUEUE_NOCLOCK`则更新rq的时间相关字段，若启用了[core schedule]([Core Scheduling &#8212; The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_dequeue`更新相关字段，忽略`sched_info_dequeue`、`psi_dequeue`、`uclamp_rq_dec`这三个函数。
+
+`update_rq_clock`函数的流程之前已经提及，`sched_core_dequeue`函数内容如下：
+
+```c
+void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
+{
+	rq->core->core_task_seq++;
+
+	if (sched_core_enqueued(p)) {
+		rb_erase(&p->core_node, &rq->core_tree);
+		RB_CLEAR_NODE(&p->core_node);
+	}
+
+	/*
+	 * Migrating the last task off the cpu, with the cpu in forced idle
+	 * state. Reschedule to create an accounting edge for forced idle,
+	 * and re-examine whether the core is still in forced idle state.
+	 */
+	if (!(flags & DEQUEUE_SAVE) && rq->nr_running == 1 &&
+	    rq->core->core_forceidle_count && rq->curr == rq->idle)
+		resched_curr(rq);
+}
+
+
+```
+
+这个函数将任务从红黑树中移除，在强制rq所在CPU为空闲状态、当前运行的任务为idle任务时调用`resched_curr`将它转移到其他的CPU中去。
+
+##### `enqueue_task`函数
+
+```c
+static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+{
+	if (!(flags & ENQUEUE_NOCLOCK))
+		update_rq_clock(rq);
+
+	if (!(flags & ENQUEUE_RESTORE)) {
+		sched_info_enqueue(rq, p);
+		psi_enqueue(p, flags & ENQUEUE_WAKEUP);
+	}
+
+	uclamp_rq_inc(rq, p);
+	p->sched_class->enqueue_task(rq, p, flags);
+
+	if (sched_core_enabled(rq))
+		sched_core_enqueue(rq, p);
+}
+
+
+```
+
+忽略`sched_info_enqueue`、`psi_enqueue`、`uclamp_rq_inc`这三个函数，这个函数调用了调度类特有的`enqueue_task`方法，若未指定`ENQUEUE_NOCLOCK`则更新rq时间相关字段，若启用了[core schedule]([Core Scheduling — The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_enqueue`函数更新相关字段，`sched_core_enqueue`函数内容如下：
+
+```c
+void sched_core_enqueue(struct rq *rq, struct task_struct *p)
+{
+	rq->core->core_task_seq++;
+
+	if (!p->core_cookie)
+		return;
+
+	rb_add(&p->core_node, &rq->core_tree, rb_sched_core_less);
+}
+
+
+```
+
+
+
+这个函数将任务加入到红黑树中之中。
+
+
 
 ## 待办
 
