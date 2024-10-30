@@ -730,73 +730,71 @@ bool cpuset_cpus_allowed_fallback(struct task_struct *tsk)
 static void
 __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
 {
-	struct rq *rq = task_rq(p);
-	bool queued, running;
+    struct rq *rq = task_rq(p);
+    bool queued, running;
 
-	/*
-	 * This here violates the locking rules for affinity, since we're only
-	 * supposed to change these variables while holding both rq->lock and
-	 * p->pi_lock.
-	 *
-	 * HOWEVER, it magically works, because ttwu() is the only code that
-	 * accesses these variables under p->pi_lock and only does so after
-	 * smp_cond_load_acquire(&p->on_cpu, !VAL), and we're in __schedule()
-	 * before finish_task().
-	 *
-	 * XXX do further audits, this smells like something putrid.
-	 */
-	if (flags & SCA_MIGRATE_DISABLE)
-		SCHED_WARN_ON(!p->on_cpu);
-	else
-		lockdep_assert_held(&p->pi_lock);
+    /*
+     * This here violates the locking rules for affinity, since we're only
+     * supposed to change these variables while holding both rq->lock and
+     * p->pi_lock.
+     *
+     * HOWEVER, it magically works, because ttwu() is the only code that
+     * accesses these variables under p->pi_lock and only does so after
+     * smp_cond_load_acquire(&p->on_cpu, !VAL), and we're in __schedule()
+     * before finish_task().
+     *
+     * XXX do further audits, this smells like something putrid.
+     */
+    if (flags & SCA_MIGRATE_DISABLE)
+        SCHED_WARN_ON(!p->on_cpu);
+    else
+        lockdep_assert_held(&p->pi_lock);
 
-	queued = task_on_rq_queued(p);
-	running = task_current(rq, p);
+    queued = task_on_rq_queued(p);
+    running = task_current(rq, p);
 
-	if (queued) {
-		/*
-		 * Because __kthread_bind() calls this on blocked tasks without
-		 * holding rq->lock.
-		 */
-		lockdep_assert_rq_held(rq);
-		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
-	}
-	if (running)
-		put_prev_task(rq, p);
+    if (queued) {
+        /*
+         * Because __kthread_bind() calls this on blocked tasks without
+         * holding rq->lock.
+         */
+        lockdep_assert_rq_held(rq);
+        dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
+    }
+    if (running)
+        put_prev_task(rq, p);
 
-	p->sched_class->set_cpus_allowed(p, new_mask, flags);
+    p->sched_class->set_cpus_allowed(p, new_mask, flags);
 
-	if (queued)
-		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
-	if (running)
-		set_next_task(rq, p);
+    if (queued)
+        enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
+    if (running)
+        set_next_task(rq, p);
 }
 ```
 
-忽略代码中`lockdep_assert_held`、`lockdep_assert_rq_held`函数，若禁止了任务在CPU之间转移并且当任务不在任何CPU中时会产生一条警告日志。若任务在某个rq之中，则先后执行`dequeue_task`、`enqueue_task`函数，若任务为当前rq中正在运行的任务则先后执行`put_prev_task`以及`set_next_task`函数。当这个任务正在rq队列之中时，这个修改会影响调度过程中的许多细节，因此需要将任务从rq中出队然后入；当这个任务为正在运行的任务时，修改任务可以使用的CPU会影响调度类中的许多细节，因此需要先执行调度器特有的`put_prev_task`以及`set_next_task`以实现先将任务放到调度类的就绪队列、执行队列之中。接下来关注这4个函数。
+忽略代码中`lockdep_assert_held`、`lockdep_assert_rq_held`函数，若禁止了任务在CPU之间转移并且当任务不在任何CPU中时会产生一条警告日志。若任务在某个rq之中，则先后执行`dequeue_task`、`enqueue_task`函数，若任务为当前rq中正在运行的任务则先后执行`put_prev_task`以及`set_next_task`函数。当这个任务正在rq队列之中时，这个修改会影响调度过程中的许多细节，因此需要将任务从rq中出队然后入；当这个任务为正在运行的任务时，修改任务可以使用的CPU会影响调度类中的许多细节，因此需要先执行调度器特有的`put_prev_task`以及`set_next_task`将任务先后放到调度类的就绪队列、执行队列之中。`put_prev_task`与`set_next_task`调用调度类的`put_prev_task`方法以及`set_next_task`方法，接下来关注`dequeue_task`、`enqueue_task`函数。
 
 ##### `dequeue_task`函数
 
 ```c
 static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 {
-	if (sched_core_enabled(rq))
-		sched_core_dequeue(rq, p, flags);
+    if (sched_core_enabled(rq))
+        sched_core_dequeue(rq, p, flags);
 
-	if (!(flags & DEQUEUE_NOCLOCK))
-		update_rq_clock(rq);
+    if (!(flags & DEQUEUE_NOCLOCK))
+        update_rq_clock(rq);
 
-	if (!(flags & DEQUEUE_SAVE)) {
-		sched_info_dequeue(rq, p);
-		psi_dequeue(p, flags & DEQUEUE_SLEEP);
-	}
+    if (!(flags & DEQUEUE_SAVE)) {
+        sched_info_dequeue(rq, p);
+        psi_dequeue(p, flags & DEQUEUE_SLEEP);
+    }
 
-	uclamp_rq_dec(rq, p);
-	p->sched_class->dequeue_task(rq, p, flags);
+    uclamp_rq_dec(rq, p);
+    p->sched_class->dequeue_task(rq, p, flags);
 }
 ```
-
-
 
 这个函数会调用调度类的`dequeue_task`方法，若未指定`DEQUEUE_NOCLOCK`则更新rq的时间相关字段，若启用了[core schedule]([Core Scheduling &#8212; The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_dequeue`更新相关字段，忽略`sched_info_dequeue`、`psi_dequeue`、`uclamp_rq_dec`这三个函数。
 
@@ -805,24 +803,22 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 ```c
 void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
 {
-	rq->core->core_task_seq++;
+    rq->core->core_task_seq++;
 
-	if (sched_core_enqueued(p)) {
-		rb_erase(&p->core_node, &rq->core_tree);
-		RB_CLEAR_NODE(&p->core_node);
-	}
+    if (sched_core_enqueued(p)) {
+        rb_erase(&p->core_node, &rq->core_tree);
+        RB_CLEAR_NODE(&p->core_node);
+    }
 
-	/*
-	 * Migrating the last task off the cpu, with the cpu in forced idle
-	 * state. Reschedule to create an accounting edge for forced idle,
-	 * and re-examine whether the core is still in forced idle state.
-	 */
-	if (!(flags & DEQUEUE_SAVE) && rq->nr_running == 1 &&
-	    rq->core->core_forceidle_count && rq->curr == rq->idle)
-		resched_curr(rq);
+    /*
+     * Migrating the last task off the cpu, with the cpu in forced idle
+     * state. Reschedule to create an accounting edge for forced idle,
+     * and re-examine whether the core is still in forced idle state.
+     */
+    if (!(flags & DEQUEUE_SAVE) && rq->nr_running == 1 &&
+        rq->core->core_forceidle_count && rq->curr == rq->idle)
+        resched_curr(rq);
 }
-
-
 ```
 
 这个函数将任务从红黑树中移除，在强制rq所在CPU为空闲状态、当前运行的任务为idle任务时调用`resched_curr`将它转移到其他的CPU中去。
@@ -832,22 +828,20 @@ void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
 ```c
 static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 {
-	if (!(flags & ENQUEUE_NOCLOCK))
-		update_rq_clock(rq);
+    if (!(flags & ENQUEUE_NOCLOCK))
+        update_rq_clock(rq);
 
-	if (!(flags & ENQUEUE_RESTORE)) {
-		sched_info_enqueue(rq, p);
-		psi_enqueue(p, flags & ENQUEUE_WAKEUP);
-	}
+    if (!(flags & ENQUEUE_RESTORE)) {
+        sched_info_enqueue(rq, p);
+        psi_enqueue(p, flags & ENQUEUE_WAKEUP);
+    }
 
-	uclamp_rq_inc(rq, p);
-	p->sched_class->enqueue_task(rq, p, flags);
+    uclamp_rq_inc(rq, p);
+    p->sched_class->enqueue_task(rq, p, flags);
 
-	if (sched_core_enabled(rq))
-		sched_core_enqueue(rq, p);
+    if (sched_core_enabled(rq))
+        sched_core_enqueue(rq, p);
 }
-
-
 ```
 
 忽略`sched_info_enqueue`、`psi_enqueue`、`uclamp_rq_inc`这三个函数，这个函数调用了调度类特有的`enqueue_task`方法，若未指定`ENQUEUE_NOCLOCK`则更新rq时间相关字段，若启用了[core schedule]([Core Scheduling — The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_enqueue`函数更新相关字段，`sched_core_enqueue`函数内容如下：
@@ -855,22 +849,147 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 ```c
 void sched_core_enqueue(struct rq *rq, struct task_struct *p)
 {
-	rq->core->core_task_seq++;
+    rq->core->core_task_seq++;
 
-	if (!p->core_cookie)
-		return;
+    if (!p->core_cookie)
+        return;
 
-	rb_add(&p->core_node, &rq->core_tree, rb_sched_core_less);
+    rb_add(&p->core_node, &rq->core_tree, rb_sched_core_less);
 }
-
-
 ```
 
+这个函数将任务加入到红黑树中之中，红黑树中的节点中应该保存了允许在这个CPU中运行的任务，详见内核的`core_schedule`特性。
 
+##### `set_task_cpu`函数
 
-这个函数将任务加入到红黑树中之中。
+```c
+void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+{
+#ifdef CONFIG_SCHED_DEBUG
+    unsigned int state = READ_ONCE(p->__state);
 
+    /*
+     * We should never call set_task_cpu() on a blocked task,
+     * ttwu() will sort out the placement.
+     */
+    WARN_ON_ONCE(state != TASK_RUNNING && state != TASK_WAKING && !p->on_rq);
 
+    /*
+     * Migrating fair class task must have p->on_rq = TASK_ON_RQ_MIGRATING,
+     * because schedstat_wait_{start,end} rebase migrating task's wait_start
+     * time relying on p->on_rq.
+     */
+    WARN_ON_ONCE(state == TASK_RUNNING &&
+             p->sched_class == &fair_sched_class &&
+             (p->on_rq && !task_on_rq_migrating(p)));
+
+#ifdef CONFIG_LOCKDEP
+    /*
+     * The caller should hold either p->pi_lock or rq->lock, when changing
+     * a task's CPU. ->pi_lock for waking tasks, rq->lock for runnable tasks.
+     *
+     * sched_move_task() holds both and thus holding either pins the cgroup,
+     * see task_group().
+     *
+     * Furthermore, all task_rq users should acquire both locks, see
+     * task_rq_lock().
+     */
+    WARN_ON_ONCE(debug_locks && !(lockdep_is_held(&p->pi_lock) ||
+                      lockdep_is_held(__rq_lockp(task_rq(p)))));
+#endif
+    /*
+     * Clearly, migrating tasks to offline CPUs is a fairly daft thing.
+     */
+    WARN_ON_ONCE(!cpu_online(new_cpu));
+
+    WARN_ON_ONCE(is_migration_disabled(p));
+#endif
+
+    trace_sched_migrate_task(p, new_cpu);
+
+    if (task_cpu(p) != new_cpu) {
+        if (p->sched_class->migrate_task_rq)
+            p->sched_class->migrate_task_rq(p, new_cpu);
+        p->se.nr_migrations++;
+        rseq_migrate(p);
+        perf_event_task_migrate(p);
+    }
+
+    __set_task_cpu(p, new_cpu);
+}
+```
+
+忽略`CONFIG_SCHED_DEBUG`、`CONFIG_LOCKDEP`这两个宏启用的代码以及`trace_sched_migrate_task`、`perf_event_task_migrate`这两个函数。当为任务选择的新的CPU与任务指定运行的CPU不一致时，需要调用调度类特定的`migrate_task_rq`方法，更新`Restartable Sequences`特性在面对任务在CPU之间移动时的需要记录的字段（具体内容见`resq_migrate`函数说明），调用`__set_task_cpu`更新任务使用的CPU。接下来关注`rseq_migrate`、`__set_task_cpu`函数内容。
+
+##### `rseq_migrate`函数
+
+```c
+/* rseq_migrate() requires preemption to be disabled. */
+static inline void rseq_migrate(struct task_struct *t)
+{
+    __set_bit(RSEQ_EVENT_MIGRATE_BIT, &t->rseq_event_mask);
+    rseq_set_notify_resume(t);
+}
+```
+
+其中`rseq_set_notify_resume`实现为：
+
+```c
+static inline void rseq_set_notify_resume(struct task_struct *t)
+{
+    if (t->rseq)
+        set_tsk_thread_flag(t, TIF_NOTIFY_RESUME);
+}
+```
+
+这个函数仅仅设置两个标记位，提醒`Restartable Sequence`实现中的其他函数这个任务运行的CPU会发生改变，`Restartable Sequence`这个功能允许用户态中的一小段代码访问per-cpu的数据结构而不需要引入锁开销。
+
+##### `__set_task_cpu`函数
+
+```c
+static inline void __set_task_cpu(struct task_struct *p, unsigned int cpu)
+{
+    set_task_rq(p, cpu);
+#ifdef CONFIG_SMP
+    /*
+     * After ->cpu is set up to a new value, task_rq_lock(p, ...) can be
+     * successfully executed on another CPU. We must ensure that updates of
+     * per-task data have been completed by this moment.
+     */
+    smp_wmb();
+    WRITE_ONCE(task_thread_info(p)->cpu, cpu);
+    p->wake_cpu = cpu;
+#endif
+}
+```
+
+使用`set_task_rq`更新任务所在的rq以及相关字段，接下来为任务设置新的运行CPU以及唤醒CPU，设置任务运行的新的CPU时使用`WRITE_ONCE`保证缓存一致性，在更新这两个信息之前使用写屏障来保证之前的写操作都已经完成。使用写屏障的原因在于一旦`cpu`字段的值被更新，会激活调度器中的其他函数，这些函数可能会使用在设置`cpu`字段之前更新的字段的值，所以要保证在更新`cpu`字段之前其他的字段更新已经完成。接下来关注`set_task_rq`函数。
+
+##### `set_task_rq`函数
+
+```c
+/* Change a task's cfs_rq and parent entity if it moves across CPUs/groups */
+static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
+{
+#if defined(CONFIG_FAIR_GROUP_SCHED) || defined(CONFIG_RT_GROUP_SCHED)
+    struct task_group *tg = task_group(p);
+#endif
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+    set_task_rq_fair(&p->se, p->se.cfs_rq, tg->cfs_rq[cpu]);
+    p->se.cfs_rq = tg->cfs_rq[cpu];
+    p->se.parent = tg->se[cpu];
+    p->se.depth = tg->se[cpu] ? tg->se[cpu]->depth + 1 : 0;
+#endif
+
+#ifdef CONFIG_RT_GROUP_SCHED
+    p->rt.rt_rq  = tg->rt_rq[cpu];
+    p->rt.parent = tg->rt_se[cpu];
+#endif
+}
+```
+
+仅考虑`CONFIG_FAIR_GROUP_SCHED`宏启动的代码，这个宏表示CFS调度器调度的基本单位为进程组而非单个进程。这段代码更新了任务所在的rq、父`sched_entity`（`p->se.parent`）、深度（`se.depth`）三个字段，后两个字段的含义与开启了进程组调度之后进程的组织方式相关。当开启了进程组调度特性之后，调度器处理的任务按照层级结构关联起来，每个任务的`se.parent`字段指向任务所在组的`sched_entity`实例，`se.depth`字段的值为任务所在的层级。
 
 ## 待办
 
