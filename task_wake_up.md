@@ -991,6 +991,94 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 
 仅考虑`CONFIG_FAIR_GROUP_SCHED`宏启动的代码，这个宏表示CFS调度器调度的基本单位为进程组而非单个进程。这段代码更新了任务所在的rq、父`sched_entity`（`p->se.parent`）、深度（`se.depth`）三个字段，后两个字段的含义与开启了进程组调度之后进程的组织方式相关。当开启了进程组调度特性之后，调度器处理的任务按照层级结构关联起来，每个任务的`se.parent`字段指向任务所在组的`sched_entity`实例，`se.depth`字段的值为任务所在的层级。
 
+#### 2.5.唤醒任务
+
+第`2.4`中的逻辑执行完成之后，直接进入这部分的代码逻辑，代码如下：
+
+```c
+	ttwu_queue(p, cpu, wake_flags);
+unlock:
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+out:
+	if (success)
+		ttwu_stat(p, task_cpu(p), wake_flags);
+	preempt_enable();
+
+	return success;
+```
+
+忽略`ttwu_stat`函数，这段代码调用`ttwu_queue`函数将任务p放入到wake list之中或者直接唤醒一个任务，随后释放`pi_lock`锁并恢复软中断，最后允许任务抢占。接下来关注`ttwu_queue`函数实现。
+
+##### `ttwu_queue`函数
+
+```c
+static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct rq_flags rf;
+
+	if (ttwu_queue_wakelist(p, cpu, wake_flags))
+		return;
+
+	rq_lock(rq, &rf);
+	update_rq_clock(rq);
+	ttwu_do_activate(rq, p, wake_flags, &rf);
+	rq_unlock(rq, &rf);
+}
+```
+
+这个函数首先尝试将任务放入到wake list之中，若失败则更新rq的时间相关字段随后开始激活这个任务，更新rq的时间相关字段以及激活任务是在持有rq的锁的情况下进行的。这两个函数（`ttwu_queue_wakelist`、`update_rq_clock`）在前边提到过，接下来关注`ttwu_do_active`函数。
+
+##### `ttwu_do_active`函数
+
+```c
+static void
+ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
+		 struct rq_flags *rf)
+{
+	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
+
+	lockdep_assert_rq_held(rq);
+
+	if (p->sched_contributes_to_load)
+		rq->nr_uninterruptible--;
+
+#ifdef CONFIG_SMP
+	if (wake_flags & WF_MIGRATED)
+		en_flags |= ENQUEUE_MIGRATED;
+	else
+#endif
+	if (p->in_iowait) {
+		delayacct_blkio_end(p);
+		atomic_dec(&task_rq(p)->nr_iowait);
+	}
+
+	activate_task(rq, p, en_flags);
+	ttwu_do_wakeup(rq, p, wake_flags, rf);
+}
+
+
+```
+
+忽略`lockdep_assert_rq_held`函数以及当`p->iowait`为真时执行的代码，这个函数调用`activate_task`将任务加入到rq之中、调用`ttwu_do_wakeup`唤醒这个任务。同时若这个任务对系统负载有贡献，即这个任务会占用CPU资源，将rq中不可中断的计数器递减（`nr_uninterruptible`）。`ttwu_do_wakeup`函数的内容在前边已经提到，接下来关注`activate_task`函数的内容。
+
+##### `activate_task`函数
+
+```c
+void activate_task(struct rq *rq, struct task_struct *p, int flags)
+{
+	if (task_on_rq_migrating(p))
+		flags |= ENQUEUE_MIGRATED;
+
+	enqueue_task(rq, p, flags);
+
+	p->on_rq = TASK_ON_RQ_QUEUED;
+}
+
+```
+
+若这个任务在CPU中移动，则此时已经完成了移动，向`flags`中添加`ENQUEUE_MIGRATED`标识标记此种情况，随后调用`enqueue_task`将任务放入到rq之中，最后将任务设置为已经在rq中（`TASK_ON_RQ_QUEUED`）。
+
 ## 待办
 
 - [ ] 整理任务`pi_lock`的作用；
