@@ -996,15 +996,15 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 第`2.4`中的逻辑执行完成之后，直接进入这部分的代码逻辑，代码如下：
 
 ```c
-	ttwu_queue(p, cpu, wake_flags);
+    ttwu_queue(p, cpu, wake_flags);
 unlock:
-	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+    raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 out:
-	if (success)
-		ttwu_stat(p, task_cpu(p), wake_flags);
-	preempt_enable();
+    if (success)
+        ttwu_stat(p, task_cpu(p), wake_flags);
+    preempt_enable();
 
-	return success;
+    return success;
 ```
 
 忽略`ttwu_stat`函数，这段代码调用`ttwu_queue`函数将任务p放入到wake list之中或者直接唤醒一个任务，随后释放`pi_lock`锁并恢复软中断，最后允许任务抢占。接下来关注`ttwu_queue`函数实现。
@@ -1014,16 +1014,16 @@ out:
 ```c
 static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 {
-	struct rq *rq = cpu_rq(cpu);
-	struct rq_flags rf;
+    struct rq *rq = cpu_rq(cpu);
+    struct rq_flags rf;
 
-	if (ttwu_queue_wakelist(p, cpu, wake_flags))
-		return;
+    if (ttwu_queue_wakelist(p, cpu, wake_flags))
+        return;
 
-	rq_lock(rq, &rf);
-	update_rq_clock(rq);
-	ttwu_do_activate(rq, p, wake_flags, &rf);
-	rq_unlock(rq, &rf);
+    rq_lock(rq, &rf);
+    update_rq_clock(rq);
+    ttwu_do_activate(rq, p, wake_flags, &rf);
+    rq_unlock(rq, &rf);
 }
 ```
 
@@ -1034,30 +1034,28 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 ```c
 static void
 ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
-		 struct rq_flags *rf)
+         struct rq_flags *rf)
 {
-	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
+    int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
 
-	lockdep_assert_rq_held(rq);
+    lockdep_assert_rq_held(rq);
 
-	if (p->sched_contributes_to_load)
-		rq->nr_uninterruptible--;
+    if (p->sched_contributes_to_load)
+        rq->nr_uninterruptible--;
 
 #ifdef CONFIG_SMP
-	if (wake_flags & WF_MIGRATED)
-		en_flags |= ENQUEUE_MIGRATED;
-	else
+    if (wake_flags & WF_MIGRATED)
+        en_flags |= ENQUEUE_MIGRATED;
+    else
 #endif
-	if (p->in_iowait) {
-		delayacct_blkio_end(p);
-		atomic_dec(&task_rq(p)->nr_iowait);
-	}
+    if (p->in_iowait) {
+        delayacct_blkio_end(p);
+        atomic_dec(&task_rq(p)->nr_iowait);
+    }
 
-	activate_task(rq, p, en_flags);
-	ttwu_do_wakeup(rq, p, wake_flags, rf);
+    activate_task(rq, p, en_flags);
+    ttwu_do_wakeup(rq, p, wake_flags, rf);
 }
-
-
 ```
 
 忽略`lockdep_assert_rq_held`函数以及当`p->iowait`为真时执行的代码，这个函数调用`activate_task`将任务加入到rq之中、调用`ttwu_do_wakeup`唤醒这个任务。同时若这个任务对系统负载有贡献，即这个任务会占用CPU资源，将rq中不可中断的计数器递减（`nr_uninterruptible`）。`ttwu_do_wakeup`函数的内容在前边已经提到，接下来关注`activate_task`函数的内容。
@@ -1067,18 +1065,13 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 ```c
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
 {
-	if (task_on_rq_migrating(p))
-		flags |= ENQUEUE_MIGRATED;
+    if (task_on_rq_migrating(p))
+        flags |= ENQUEUE_MIGRATED;
 
-	enqueue_task(rq, p, flags);
+    enqueue_task(rq, p, flags);
 
-	p->on_rq = TASK_ON_RQ_QUEUED;
+    p->on_rq = TASK_ON_RQ_QUEUED;
 }
-
 ```
 
 若这个任务在CPU中移动，则此时已经完成了移动，向`flags`中添加`ENQUEUE_MIGRATED`标识标记此种情况，随后调用`enqueue_task`将任务放入到rq之中，最后将任务设置为已经在rq中（`TASK_ON_RQ_QUEUED`）。
-
-## 待办
-
-- [ ] 整理任务`pi_lock`的作用；
