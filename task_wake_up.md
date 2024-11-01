@@ -796,7 +796,7 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 }
 ```
 
-这个函数会调用调度类的`dequeue_task`方法，若未指定`DEQUEUE_NOCLOCK`则更新rq的时间相关字段，若启用了[core schedule]([Core Scheduling &#8212; The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_dequeue`更新相关字段，忽略`sched_info_dequeue`、`psi_dequeue`、`uclamp_rq_dec`这三个函数。
+这个函数会调用调度类的`dequeue_task`方法，若未指定`DEQUEUE_NOCLOCK`则更新rq的时间相关字段，若启用了core schedule([Core Scheduling &#8212; The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_dequeue`更新相关字段，忽略`sched_info_dequeue`、`psi_dequeue`、`uclamp_rq_dec`这三个函数。
 
 `update_rq_clock`函数的流程之前已经提及，`sched_core_dequeue`函数内容如下：
 
