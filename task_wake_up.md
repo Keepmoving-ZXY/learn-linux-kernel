@@ -63,7 +63,7 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
 #ifdef CONFIG_PREEMPT_RT
     /*
      * Saved state preserves the task state across blocking on
-     * an RT lock.  If the state matches, set p::saved_state to
+     * an RT lock.  If the state matches,  p::saved_state to
      * TASK_RUNNING, but do not wake the task because it waits
      * for a lock wakeup. Also indicate success because from
      * the regular waker's point of view this has succeeded.
@@ -527,6 +527,20 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
 
 ##### `select_task_rq`函数
 
+该函数的内部函数调用拓扑如下所示：
+
+```
+select_task_rq:
+    is_cpu_allowed
+    select_fallback_rq
+        cpuset_cpus_allowed_fallback
+            __do_set_cpus_allowed
+                dequeue_task
+                enqueue_task
+```
+
+
+
 ```c
 static inline
 int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
@@ -861,6 +875,15 @@ void sched_core_enqueue(struct rq *rq, struct task_struct *p)
 这个函数将任务加入到红黑树中之中，红黑树中的节点中应该保存了允许在这个CPU中运行的任务，详见内核的`core_schedule`特性。
 
 ##### `set_task_cpu`函数
+
+该函数内部调用拓扑如下：
+
+```
+set_task_cpu:
+    rseq_migrate
+    __set_task_cpu
+        set_task_rq
+```
 
 ```c
 void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
