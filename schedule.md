@@ -14,10 +14,10 @@
 static void hrtick_rq_init(struct rq *rq)
 {
 #ifdef CONFIG_SMP
-	INIT_CSD(&rq->hrtick_csd, __hrtick_start, rq);
+    INIT_CSD(&rq->hrtick_csd, __hrtick_start, rq);
 #endif
-	hrtimer_init(&rq->hrtick_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
-	rq->hrtick_timer.function = hrtick;
+    hrtimer_init(&rq->hrtick_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
+    rq->hrtick_timer.function = hrtick;
 }
 ```
 
@@ -33,20 +33,20 @@ static void hrtick_rq_init(struct rq *rq)
  */
 void hrtick_start(struct rq *rq, u64 delay)
 {
-	struct hrtimer *timer = &rq->hrtick_timer;
-	s64 delta;
+    struct hrtimer *timer = &rq->hrtick_timer;
+    s64 delta;
 
-	/*
-	 * Don't schedule slices shorter than 10000ns, that just
-	 * doesn't make sense and can cause timer DoS.
-	 */
-	delta = max_t(s64, delay, 10000LL);
-	rq->hrtick_time = ktime_add_ns(timer->base->get_time(), delta);
+    /*
+     * Don't schedule slices shorter than 10000ns, that just
+     * doesn't make sense and can cause timer DoS.
+     */
+    delta = max_t(s64, delay, 10000LL);
+    rq->hrtick_time = ktime_add_ns(timer->base->get_time(), delta);
 
-	if (rq == this_rq())
-		__hrtick_restart(rq);
-	else
-		smp_call_function_single_async(cpu_of(rq), &rq->hrtick_csd);
+    if (rq == this_rq())
+        __hrtick_restart(rq);
+    else
+        smp_call_function_single_async(cpu_of(rq), &rq->hrtick_csd);
 }
 ```
 
@@ -57,10 +57,10 @@ void hrtick_start(struct rq *rq, u64 delay)
 ```c
 static void __hrtick_restart(struct rq *rq)
 {
-	struct hrtimer *timer = &rq->hrtick_timer;
-	ktime_t time = rq->hrtick_time;
+    struct hrtimer *timer = &rq->hrtick_timer;
+    ktime_t time = rq->hrtick_time;
 
-	hrtimer_start(timer, time, HRTIMER_MODE_ABS_PINNED_HARD);
+    hrtimer_start(timer, time, HRTIMER_MODE_ABS_PINNED_HARD);
 }
 ```
 
@@ -74,12 +74,12 @@ static void __hrtick_restart(struct rq *rq)
  */
 static void __hrtick_start(void *arg)
 {
-	struct rq *rq = arg;
-	struct rq_flags rf;
+    struct rq *rq = arg;
+    struct rq_flags rf;
 
-	rq_lock(rq, &rf);
-	__hrtick_restart(rq);
-	rq_unlock(rq, &rf);
+    rq_lock(rq, &rf);
+    __hrtick_restart(rq);
+    rq_unlock(rq, &rf);
 }
 ```
 
@@ -94,18 +94,75 @@ static void __hrtick_start(void *arg)
  */
 static enum hrtimer_restart hrtick(struct hrtimer *timer)
 {
-	struct rq *rq = container_of(timer, struct rq, hrtick_timer);
-	struct rq_flags rf;
+    struct rq *rq = container_of(timer, struct rq, hrtick_timer);
+    struct rq_flags rf;
 
-	WARN_ON_ONCE(cpu_of(rq) != smp_processor_id());
+    WARN_ON_ONCE(cpu_of(rq) != smp_processor_id());
 
-	rq_lock(rq, &rf);
-	update_rq_clock(rq);
-	rq->curr->sched_class->task_tick(rq, rq->curr, 1);
-	rq_unlock(rq, &rf);
+    rq_lock(rq, &rf);
+    update_rq_clock(rq);
+    rq->curr->sched_class->task_tick(rq, rq->curr, 1);
+    rq_unlock(rq, &rf);
 
-	return HRTIMER_NORESTART;
+    return HRTIMER_NORESTART;
 }
 ```
 
 这个函数在持有rq锁的前提下，更新rq的时间相关字段、调用rq所在CPU中正在运行的任务使用的调度类的`task_tick`方法。注意到这个函数返回的是`HRTIMER_NORESTART`，意味着这个定时器不会自动启用，在调度类中才会继续启动这个定时器，例如CFS的`enqueue_task_fair`函数。
+
+### 2.任务切换
+
+#### `switch_to`函数
+
+```c
+/*
+ * %rdi: prev task
+ * %rsi: next task
+ */
+.pushsection .text, "ax"
+SYM_FUNC_START(__switch_to_asm)
+    /*
+     * Save callee-saved registers
+     * This must match the order in inactive_task_frame
+     */
+    pushq    %rbp
+    pushq    %rbx
+    pushq    %r12
+    pushq    %r13
+    pushq    %r14
+    pushq    %r15
+
+    /* switch stack */
+    movq    %rsp, TASK_threadsp(%rdi)
+    movq    TASK_threadsp(%rsi), %rsp
+
+#ifdef CONFIG_STACKPROTECTOR
+    movq    TASK_stack_canary(%rsi), %rbx
+    movq    %rbx, PER_CPU_VAR(fixed_percpu_data) + stack_canary_offset
+#endif
+
+    /*
+     * When switching from a shallower to a deeper call stack
+     * the RSB may either underflow or use entries populated
+     * with userspace addresses. On CPUs where those concerns
+     * exist, overwrite the RSB with entries which capture
+     * speculative execution to prevent attack.
+     */
+    FILL_RETURN_BUFFER %r12, RSB_CLEAR_LOOPS, X86_FEATURE_RSB_CTXSW
+
+    /* restore callee-saved registers */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    popq    %rbp
+
+    jmp    __switch_to
+SYM_FUNC_END(__switch_to_asm)
+.popsection
+```
+
+这个函数执行任务抢占过程中非常关键的一个函数，这个函数中有一些微妙的细节，结合一个例子来理解这些微妙的细节。假设`switch_to`函数的`prev`为任务b、`next`为任务a、任务a此时运行在CPU 3之中、在任务c运行时抢占了任务b的CPU资源，那么在调用`__switch_to_asm`函数时是在CPU 3上执行任务a的过程中，`pushq`使用的栈空间为任务a的栈空间。
+
+先关注任务c抢占任务b时发生的情况，这些情况有助于理解任务b抢占任务a过程中的部分内容，即执行`popq`指令的时候使用的栈究竟是谁的栈。此时这个函数执行的时候`prev`为任务b、`next`为任务c、在任务b所在的CPU中运行此函数。此函数首先将`rbp`、`rbx`、`r12-r15`寄存器内容放入到任务b的栈之中，然后使用`movq %rsp, TASK_THREADSP(%rdi)`将`rsp`寄存器的值放入到任务b的`task_struct->thread_struct->sp`字段之中、使用`movq TASK_threadsp(%rsi), %rsp`将任务c的栈地址写入到`rsp`寄存器中，后续代码开始使用c的栈空间而非b的栈空间。接下来的`popq`指令使用的栈是任务c的栈空间而非任务b的栈空间，恢复寄存器的值（这些值是在任务c被其他任务抢占的时候执行这个函数中前几个`pushq`指令的时候入栈的）。从这里看到这个函数中`pushq`使用的栈与`popq`使用的栈不同同一个栈，`pushq`使用的栈是被抢占任务的栈，而`popq`使用的栈是即将恢复执行任务的栈。接下来`__switch_to`函数之后任务b失去CPU资源，导致任务b处于暂停状态，任务c开始执行。
