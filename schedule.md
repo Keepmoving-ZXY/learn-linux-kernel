@@ -137,239 +137,309 @@ asmlinkage __visible void __sched schedule(void)
 static struct task_struct *
 pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
-	struct task_struct *next, *p, *max = NULL;
-	const struct cpumask *smt_mask;
-	bool fi_before = false;
-	bool core_clock_updated = (rq == rq->core);
-	unsigned long cookie;
-	int i, cpu, occ = 0;
-	struct rq *rq_i;
-	bool need_sync;
+    struct task_struct *next, *p, *max = NULL;
+    const struct cpumask *smt_mask;
+    bool fi_before = false;
+    bool core_clock_updated = (rq == rq->core);
+    unsigned long cookie;
+    int i, cpu, occ = 0;
+    struct rq *rq_i;
+    bool need_sync;
 
-	if (!sched_core_enabled(rq))
-		return __pick_next_task(rq, prev, rf);
+    if (!sched_core_enabled(rq))
+        return __pick_next_task(rq, prev, rf);
 
-	cpu = cpu_of(rq);
+    cpu = cpu_of(rq);
 
-	/* Stopper task is switching into idle, no need core-wide selection. */
-	if (cpu_is_offline(cpu)) {
-		/*
-		 * Reset core_pick so that we don't enter the fastpath when
-		 * coming online. core_pick would already be migrated to
-		 * another cpu during offline.
-		 */
-		rq->core_pick = NULL;
-		return __pick_next_task(rq, prev, rf);
-	}
+    /* Stopper task is switching into idle, no need core-wide selection. */
+    if (cpu_is_offline(cpu)) {
+        /*
+         * Reset core_pick so that we don't enter the fastpath when
+         * coming online. core_pick would already be migrated to
+         * another cpu during offline.
+         */
+        rq->core_pick = NULL;
+        return __pick_next_task(rq, prev, rf);
+    }
 
-	/*
-	 * If there were no {en,de}queues since we picked (IOW, the task
-	 * pointers are all still valid), and we haven't scheduled the last
-	 * pick yet, do so now.
-	 *
-	 * rq->core_pick can be NULL if no selection was made for a CPU because
-	 * it was either offline or went offline during a sibling's core-wide
-	 * selection. In this case, do a core-wide selection.
-	 */
-	if (rq->core->core_pick_seq == rq->core->core_task_seq &&
-	    rq->core->core_pick_seq != rq->core_sched_seq &&
-	    rq->core_pick) {
-		WRITE_ONCE(rq->core_sched_seq, rq->core->core_pick_seq);
+    /*
+     * If there were no {en,de}queues since we picked (IOW, the task
+     * pointers are all still valid), and we haven't scheduled the last
+     * pick yet, do so now.
+     *
+     * rq->core_pick can be NULL if no selection was made for a CPU because
+     * it was either offline or went offline during a sibling's core-wide
+     * selection. In this case, do a core-wide selection.
+     */
+    if (rq->core->core_pick_seq == rq->core->core_task_seq &&
+        rq->core->core_pick_seq != rq->core_sched_seq &&
+        rq->core_pick) {
+        WRITE_ONCE(rq->core_sched_seq, rq->core->core_pick_seq);
 
-		next = rq->core_pick;
-		if (next != prev) {
-			put_prev_task(rq, prev);
-			set_next_task(rq, next);
-		}
+        next = rq->core_pick;
+        if (next != prev) {
+            put_prev_task(rq, prev);
+            set_next_task(rq, next);
+        }
 
-		rq->core_pick = NULL;
-		goto out;
-	}
+        rq->core_pick = NULL;
+        goto out;
+    }
 
-	put_prev_task_balance(rq, prev, rf);
+    put_prev_task_balance(rq, prev, rf);
 
-	smt_mask = cpu_smt_mask(cpu);
-	need_sync = !!rq->core->core_cookie;
+    smt_mask = cpu_smt_mask(cpu);
+    need_sync = !!rq->core->core_cookie;
 
-	/* reset state */
-	rq->core->core_cookie = 0UL;
-	if (rq->core->core_forceidle_count) {
-		if (!core_clock_updated) {
-			update_rq_clock(rq->core);
-			core_clock_updated = true;
-		}
-		sched_core_account_forceidle(rq);
-		/* reset after accounting force idle */
-		rq->core->core_forceidle_start = 0;
-		rq->core->core_forceidle_count = 0;
-		rq->core->core_forceidle_occupation = 0;
-		need_sync = true;
-		fi_before = true;
-	}
+    /* reset state */
+    rq->core->core_cookie = 0UL;
+    if (rq->core->core_forceidle_count) {
+        if (!core_clock_updated) {
+            update_rq_clock(rq->core);
+            core_clock_updated = true;
+        }
+        sched_core_account_forceidle(rq);
+        /* reset after accounting force idle */
+        rq->core->core_forceidle_start = 0;
+        rq->core->core_forceidle_count = 0;
+        rq->core->core_forceidle_occupation = 0;
+        need_sync = true;
+        fi_before = true;
+    }
 
-	/*
-	 * core->core_task_seq, core->core_pick_seq, rq->core_sched_seq
-	 *
-	 * @task_seq guards the task state ({en,de}queues)
-	 * @pick_seq is the @task_seq we did a selection on
-	 * @sched_seq is the @pick_seq we scheduled
-	 *
-	 * However, preemptions can cause multiple picks on the same task set.
-	 * 'Fix' this by also increasing @task_seq for every pick.
-	 */
-	rq->core->core_task_seq++;
+    /*
+     * core->core_task_seq, core->core_pick_seq, rq->core_sched_seq
+     *
+     * @task_seq guards the task state ({en,de}queues)
+     * @pick_seq is the @task_seq we did a selection on
+     * @sched_seq is the @pick_seq we scheduled
+     *
+     * However, preemptions can cause multiple picks on the same task set.
+     * 'Fix' this by also increasing @task_seq for every pick.
+     */
+    rq->core->core_task_seq++;
 
-	/*
-	 * Optimize for common case where this CPU has no cookies
-	 * and there are no cookied tasks running on siblings.
-	 */
-	if (!need_sync) {
-		next = pick_task(rq);
-		if (!next->core_cookie) {
-			rq->core_pick = NULL;
-			/*
-			 * For robustness, update the min_vruntime_fi for
-			 * unconstrained picks as well.
-			 */
-			WARN_ON_ONCE(fi_before);
-			task_vruntime_update(rq, next, false);
-			goto out_set_next;
-		}
-	}
+    /*
+     * Optimize for common case where this CPU has no cookies
+     * and there are no cookied tasks running on siblings.
+     */
+    if (!need_sync) {
+        next = pick_task(rq);
+        if (!next->core_cookie) {
+            rq->core_pick = NULL;
+            /*
+             * For robustness, update the min_vruntime_fi for
+             * unconstrained picks as well.
+             */
+            WARN_ON_ONCE(fi_before);
+            task_vruntime_update(rq, next, false);
+            goto out_set_next;
+        }
+    }
 
-	/*
-	 * For each thread: do the regular task pick and find the max prio task
-	 * amongst them.
-	 *
-	 * Tie-break prio towards the current CPU
-	 */
-	for_each_cpu_wrap(i, smt_mask, cpu) {
-		rq_i = cpu_rq(i);
+    /*
+     * For each thread: do the regular task pick and find the max prio task
+     * amongst them.
+     *
+     * Tie-break prio towards the current CPU
+     */
+    for_each_cpu_wrap(i, smt_mask, cpu) {
+        rq_i = cpu_rq(i);
 
-		/*
-		 * Current cpu always has its clock updated on entrance to
-		 * pick_next_task(). If the current cpu is not the core,
-		 * the core may also have been updated above.
-		 */
-		if (i != cpu && (rq_i != rq->core || !core_clock_updated))
-			update_rq_clock(rq_i);
+        /*
+         * Current cpu always has its clock updated on entrance to
+         * pick_next_task(). If the current cpu is not the core,
+         * the core may also have been updated above.
+         */
+        if (i != cpu && (rq_i != rq->core || !core_clock_updated))
+            update_rq_clock(rq_i);
 
-		p = rq_i->core_pick = pick_task(rq_i);
-		if (!max || prio_less(max, p, fi_before))
-			max = p;
-	}
+        p = rq_i->core_pick = pick_task(rq_i);
+        if (!max || prio_less(max, p, fi_before))
+            max = p;
+    }
 
-	cookie = rq->core->core_cookie = max->core_cookie;
+    cookie = rq->core->core_cookie = max->core_cookie;
 
-	/*
-	 * For each thread: try and find a runnable task that matches @max or
-	 * force idle.
-	 */
-	for_each_cpu(i, smt_mask) {
-		rq_i = cpu_rq(i);
-		p = rq_i->core_pick;
+    /*
+     * For each thread: try and find a runnable task that matches @max or
+     * force idle.
+     */
+    for_each_cpu(i, smt_mask) {
+        rq_i = cpu_rq(i);
+        p = rq_i->core_pick;
 
-		if (!cookie_equals(p, cookie)) {
-			p = NULL;
-			if (cookie)
-				p = sched_core_find(rq_i, cookie);
-			if (!p)
-				p = idle_sched_class.pick_task(rq_i);
-		}
+        if (!cookie_equals(p, cookie)) {
+            p = NULL;
+            if (cookie)
+                p = sched_core_find(rq_i, cookie);
+            if (!p)
+                p = idle_sched_class.pick_task(rq_i);
+        }
 
-		rq_i->core_pick = p;
+        rq_i->core_pick = p;
 
-		if (p == rq_i->idle) {
-			if (rq_i->nr_running) {
-				rq->core->core_forceidle_count++;
-				if (!fi_before)
-					rq->core->core_forceidle_seq++;
-			}
-		} else {
-			occ++;
-		}
-	}
+        if (p == rq_i->idle) {
+            if (rq_i->nr_running) {
+                rq->core->core_forceidle_count++;
+                if (!fi_before)
+                    rq->core->core_forceidle_seq++;
+            }
+        } else {
+            occ++;
+        }
+    }
 
-	if (schedstat_enabled() && rq->core->core_forceidle_count) {
-		rq->core->core_forceidle_start = rq_clock(rq->core);
-		rq->core->core_forceidle_occupation = occ;
-	}
+    if (schedstat_enabled() && rq->core->core_forceidle_count) {
+        rq->core->core_forceidle_start = rq_clock(rq->core);
+        rq->core->core_forceidle_occupation = occ;
+    }
 
-	rq->core->core_pick_seq = rq->core->core_task_seq;
-	next = rq->core_pick;
-	rq->core_sched_seq = rq->core->core_pick_seq;
+    rq->core->core_pick_seq = rq->core->core_task_seq;
+    next = rq->core_pick;
+    rq->core_sched_seq = rq->core->core_pick_seq;
 
-	/* Something should have been selected for current CPU */
-	WARN_ON_ONCE(!next);
+    /* Something should have been selected for current CPU */
+    WARN_ON_ONCE(!next);
 
-	/*
-	 * Reschedule siblings
-	 *
-	 * NOTE: L1TF -- at this point we're no longer running the old task and
-	 * sending an IPI (below) ensures the sibling will no longer be running
-	 * their task. This ensures there is no inter-sibling overlap between
-	 * non-matching user state.
-	 */
-	for_each_cpu(i, smt_mask) {
-		rq_i = cpu_rq(i);
+    /*
+     * Reschedule siblings
+     *
+     * NOTE: L1TF -- at this point we're no longer running the old task and
+     * sending an IPI (below) ensures the sibling will no longer be running
+     * their task. This ensures there is no inter-sibling overlap between
+     * non-matching user state.
+     */
+    for_each_cpu(i, smt_mask) {
+        rq_i = cpu_rq(i);
 
-		/*
-		 * An online sibling might have gone offline before a task
-		 * could be picked for it, or it might be offline but later
-		 * happen to come online, but its too late and nothing was
-		 * picked for it.  That's Ok - it will pick tasks for itself,
-		 * so ignore it.
-		 */
-		if (!rq_i->core_pick)
-			continue;
+        /*
+         * An online sibling might have gone offline before a task
+         * could be picked for it, or it might be offline but later
+         * happen to come online, but its too late and nothing was
+         * picked for it.  That's Ok - it will pick tasks for itself,
+         * so ignore it.
+         */
+        if (!rq_i->core_pick)
+            continue;
 
-		/*
-		 * Update for new !FI->FI transitions, or if continuing to be in !FI:
-		 * fi_before     fi      update?
-		 *  0            0       1
-		 *  0            1       1
-		 *  1            0       1
-		 *  1            1       0
-		 */
-		if (!(fi_before && rq->core->core_forceidle_count))
-			task_vruntime_update(rq_i, rq_i->core_pick, !!rq->core->core_forceidle_count);
+        /*
+         * Update for new !FI->FI transitions, or if continuing to be in !FI:
+         * fi_before     fi      update?
+         *  0            0       1
+         *  0            1       1
+         *  1            0       1
+         *  1            1       0
+         */
+        if (!(fi_before && rq->core->core_forceidle_count))
+            task_vruntime_update(rq_i, rq_i->core_pick, !!rq->core->core_forceidle_count);
 
-		rq_i->core_pick->core_occupation = occ;
+        rq_i->core_pick->core_occupation = occ;
 
-		if (i == cpu) {
-			rq_i->core_pick = NULL;
-			continue;
-		}
+        if (i == cpu) {
+            rq_i->core_pick = NULL;
+            continue;
+        }
 
-		/* Did we break L1TF mitigation requirements? */
-		WARN_ON_ONCE(!cookie_match(next, rq_i->core_pick));
+        /* Did we break L1TF mitigation requirements? */
+        WARN_ON_ONCE(!cookie_match(next, rq_i->core_pick));
 
-		if (rq_i->curr == rq_i->core_pick) {
-			rq_i->core_pick = NULL;
-			continue;
-		}
+        if (rq_i->curr == rq_i->core_pick) {
+            rq_i->core_pick = NULL;
+            continue;
+        }
 
-		resched_curr(rq_i);
-	}
+        resched_curr(rq_i);
+    }
 
 out_set_next:
-	set_next_task(rq, next);
+    set_next_task(rq, next);
 out:
-	if (rq->core->core_forceidle_count && next == rq->idle)
-		queue_core_balance(rq);
+    if (rq->core->core_forceidle_count && next == rq->idle)
+        queue_core_balance(rq);
 
-	return next;
+    return next;
 }
-
 ```
 
 这个函数是开启[core scheduling](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html)特性之后的`pick_next_task`函数实现，这个实现比不启用`core scheduling`特性的实现要复杂许多，其中一个主要的概念是core cookie。每个任务的task_struct结构中都有一个叫做core_cookie的字段，这个字段存储一个数值，只有具有相同的core_cookie字段值的任务才能够在同一个cpu之中执行，这样可以防止一部分的侧信道攻击。
 
-函数一开始考虑两种比较简单的情况，若`core_schedule`特性未启用或者参数中rq所在的cpu无法使用，则调用`__pick_next_task`函数返回下一个可以执行的任务，后边会详细记录这个函数的流程。
+```c
+    if (!sched_core_enabled(rq))
+        return __pick_next_task(rq, prev, rf);
 
-接下来的流程涉及到新的任务调度，这个过程中涉及`core_task_seq`、`core_pick_seq`、`core_sched_seq`三个字段的值的判断，`core_task_seq`在每次将任务放入到rq、从rq中出队时都会递增，这意味着接下来要执行的进程会发生变化；`core_pick_seq`标记某次的rq入队或出队操作是否有新的任务选择与之对应，即rq入队或出队操作之后执行了新运行任务的选择，则将`core_pick_seq`的值更新为`core_task_seq`的值，此时新选择的任务放在`rq->core_pick`字段。当新运行的任务即将抢占其他占用cpu的任务时将`core_sched_seq`更新为`core_pick_seq`的值。因为在rq上进行入队、出队操作之后可能并不会立马进行新执行任务的选择，进行了新的任务选择之后并不会立马让新选择的任务抢占其他的任务，所以需要使用这三个字段来同步rq变动、新的任务选择、新的任务调度这三个过程。若`rq->core->core_pick_seq == rq->core->core_task_seq`并且`rq->core->core_pick_seq != rq->core_sched_seq`相同时表示rq变动之后已经选择了新的任务，但是新的任务还没有执行。此时若`rq->core_pick`不为空并且不是正在运行的任务，调用调度类的`put_prev_task`（当任务被抢占时执行此方法）、`set_next_task`方法（当任务抢占其他任务的时候执行此方法），然后跳转到`out`这个标签处继续执行。
+    cpu = cpu_of(rq);
 
+    /* Stopper task is switching into idle, no need core-wide selection. */
+    if (cpu_is_offline(cpu)) {
+        /*
+         * Reset core_pick so that we don't enter the fastpath when
+         * coming online. core_pick would already be migrated to
+         * another cpu during offline.
+         */
+        rq->core_pick = NULL;
+        return __pick_next_task(rq, prev, rf);
+    }
+```
 
+这部分代码是函数最开始执行的代码逻辑，考虑两种比较简单的情况，若`core_schedule`特性未启用或者参数中rq所在的cpu无法使用，则调用`__pick_next_task`函数返回下一个可以执行的任务，后边会详细记录这个函数的流程。
+
+```c
+    /*
+     * If there were no {en,de}queues since we picked (IOW, the task
+     * pointers are all still valid), and we haven't scheduled the last
+     * pick yet, do so now.
+     *
+     * rq->core_pick can be NULL if no selection was made for a CPU because
+     * it was either offline or went offline during a sibling's core-wide
+     * selection. In this case, do a core-wide selection.
+     */
+    if (rq->core->core_pick_seq == rq->core->core_task_seq &&
+        rq->core->core_pick_seq != rq->core_sched_seq &&
+        rq->core_pick) {
+        WRITE_ONCE(rq->core_sched_seq, rq->core->core_pick_seq);
+
+        next = rq->core_pick;
+        if (next != prev) {
+            put_prev_task(rq, prev);
+            set_next_task(rq, next);
+        }
+
+        rq->core_pick = NULL;
+        goto out;
+    }
+```
+
+这部分代码关心到新进程的调度，这里边的逻辑涉及到`core_task_seq`、`core_pick_seq`、`core_sched_seq`三个字段的值的判断，`core_task_seq`在每次将任务放入到rq、从rq中出队时都会递增，这意味着接下来要执行的进程会发生变化；`core_pick_seq`标记某次的rq入队或出队操作是否有新的任务选择与之对应，即rq入队或出队操作之后执行了新运行任务的选择，则将`core_pick_seq`的值更新为`core_task_seq`的值，此时新选择的任务放在`rq->core_pick`字段。当新运行的任务即将抢占其他占用cpu的任务时将`core_sched_seq`更新为`core_pick_seq`的值。因为在rq上进行入队、出队操作之后可能并不会立马进行新执行任务的选择，进行了新的任务选择之后并不会立马让新选择的任务抢占其他的任务，所以需要使用这三个字段来同步rq变动、新的任务选择、新的任务调度这三个过程。若`rq->core->core_pick_seq == rq->core->core_task_seq`并且`rq->core->core_pick_seq != rq->core_sched_seq`相同时表示rq变动之后已经选择了新的任务，但是新的任务还没有执行。此时若`rq->core_pick`不为空并且不是正在运行的任务，调用调度类的`put_prev_task`（当任务被抢占时执行此方法）、`set_next_task`方法（当任务抢占其他任务的时候执行此方法），然后跳转到`out`这个标签处继续执行。
+
+```c
+    put_prev_task_balance(rq, prev, rf);
+
+    smt_mask = cpu_smt_mask(cpu);
+    need_sync = !!rq->core->core_cookie;
+```
+
+这三行代码与后边的流程紧密相关，逐一记录每行代码的含义。`put_prev_task_balance`函数按照优先级从高到低的顺序调用调度类的`balance`方法，然后对即将被抢占的任务调用调度类的`put_prev_task`函数，后边会详细记录`put_prev_task_balance`函数流程。`smt`是`Simultaneous Multi-Threading`的缩写，intel的许多处理器都支持超线程技术，开启超线程技术的情况下一颗物理内核对应两颗虚拟内核，这种情况就叫做`Simultaneous Multi-Threading`技术。`cpu_smt_mask`返回的是所有的逻辑cpu，这些cpu实际上是同一颗物理cpu通过`SMT`技术（例如intel的超线程技术）虚拟出来的。`need_sync`表明当前的rq中是否设置了`core_cookie`的值。
+
+```c
+    /* reset state */
+    rq->core->core_cookie = 0UL;
+    if (rq->core->core_forceidle_count) {
+        if (!core_clock_updated) {
+            update_rq_clock(rq->core);
+            core_clock_updated = true;
+        }
+        sched_core_account_forceidle(rq);
+        /* reset after accounting force idle */
+        rq->core->core_forceidle_start = 0;
+        rq->core->core_forceidle_count = 0;
+        rq->core->core_forceidle_occupation = 0;
+        need_sync = true;
+        fi_before = true;
+    }
+```
+
+在这个函数的后续流程会提到，当某个逻辑cpu选择接下来执行的任务为idle task，那么`core_forceidle_count`这个字段将不为0，这个字段对于所有属于同一颗物理cpu的逻辑cpu都可见。当这个字段的值不为0时调用`sched_core_account_forceidle`函数更新关于force idle的相关统计信息、重置这颗物理cpu中force idle的相关字段，将`need_sync`、`fi_before`设置为True。`need_sync`为`True`表示物理cpu的core_cookie的值需要重新设置、`fi_before`为`True`意味着之前某个逻辑cpu中选择了idle task作为即将执行的任务，这两个字段具体带来的影响在后续的流程中详细记录。<u>这里我不理解的地方是为什么不需要考虑缓存一致性，即这块代码可能在一个物理cpu中对应的多个逻辑cpu中执行，某个逻辑cpu更新了`core_forceidle_count`的值之后另外一个逻辑cpu可能无法看到，导致统计字段重复更新。</u>
 
 #### `__switch_to_asm`函数
 
