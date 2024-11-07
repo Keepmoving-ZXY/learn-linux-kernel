@@ -439,7 +439,59 @@ out:
     }
 ```
 
-在这个函数的后续流程会提到，当某个逻辑cpu选择接下来执行的任务为idle task，那么`core_forceidle_count`这个字段将不为0，这个字段对于所有属于同一颗物理cpu的逻辑cpu都可见。当这个字段的值不为0时调用`sched_core_account_forceidle`函数更新关于force idle的相关统计信息、重置这颗物理cpu中force idle的相关字段，将`need_sync`、`fi_before`设置为True。`need_sync`为`True`表示物理cpu的core_cookie的值需要重新设置、`fi_before`为`True`意味着之前某个逻辑cpu中选择了idle task作为即将执行的任务，这两个字段具体带来的影响在后续的流程中详细记录。<u>这里我不理解的地方是为什么不需要考虑缓存一致性，即这块代码可能在一个物理cpu中对应的多个逻辑cpu中执行，某个逻辑cpu更新了`core_forceidle_count`的值之后另外一个逻辑cpu可能无法看到，导致统计字段重复更新。</u>
+在这个函数的后续流程会提到，某个逻辑cpu中无法找到与指定`core_cookie`值相匹配的任务时，只能选择一个idle task来运行，此时`core_forceidle_count`这个字段将不为0，这个字段对于所有属于同一颗物理cpu的逻辑cpu都可见。当这个字段的值不为0时调用`sched_core_account_forceidle`函数更新关于force idle的相关统计信息、重置这颗物理cpu中force idle的相关字段，将`need_sync`、`fi_before`设置为True。`need_sync`为`True`表示物理cpu的core_cookie的值需要重新设置、`fi_before`为`True`意味着之前某个逻辑cpu中选择了idle task作为即将执行的任务，这两个字段具体带来的影响在后续的流程中详细记录。<u>这里我不理解的地方是为什么不需要考虑缓存一致性，即这块代码可能在一个物理cpu中对应的多个逻辑cpu中执行，某个逻辑cpu重置了`core_forceidle_count`的值之后另外一个逻辑cpu可能无法看到，导致统计字段重复更新。</u>
+
+```c
+    /*
+     * Optimize for common case where this CPU has no cookies
+     * and there are no cookied tasks running on siblings.
+     */
+    if (!need_sync) {
+        next = pick_task(rq);
+        if (!next->core_cookie) {
+            rq->core_pick = NULL;
+            /*
+             * For robustness, update the min_vruntime_fi for
+             * unconstrained picks as well.
+             */
+            WARN_ON_ONCE(fi_before);
+            task_vruntime_update(rq, next, false);
+            goto out_set_next;
+        }
+    }
+    
+    cookie = rq->core->core_cookie = max->core_cookie;
+```
+
+当还没有一个`core_cookie`设置到某个逻辑cpu上时，此时cpu中运行的可能是idle task，调用`pick_task`函数按照调度类的优先级调用每个调度类的`pick_task`方法，直到某个调度类的`pick_next`方法返回一个任务，这个任务就是接下来在这个逻辑cpu上执行的任务。若选出来的task中没有设置`core_cookie`，调用CFS的`task_vruntime_update`函数更新cfs_rq的`min_vruntime_fi`字段，这里忽略这个字段的含义。接下来代码跳转到`out_set_next`标记处继续执行。
+
+```c
+    /*
+     * For each thread: do the regular task pick and find the max prio task
+     * amongst them.
+     *
+     * Tie-break prio towards the current CPU
+     */
+    for_each_cpu_wrap(i, smt_mask, cpu) {
+        rq_i = cpu_rq(i);
+
+        /*
+         * Current cpu always has its clock updated on entrance to
+         * pick_next_task(). If the current cpu is not the core,
+         * the core may also have been updated above.
+         */
+        if (i != cpu && (rq_i != rq->core || !core_clock_updated))
+            update_rq_clock(rq_i);
+
+        p = rq_i->core_pick = pick_task(rq_i);
+        if (!max || prio_less(max, p, fi_before))
+            max = p;
+    }
+```
+
+当某个逻辑cpu的`core_cookie`在之前已经设置，会执行这部段代码。这段代码是从某个物理cpu的某个逻辑cpu开始编译这个物理cpu上的所有逻辑cpu，从中选出来优先级最高的task，将这个task的`core_cookie`设置为这个逻辑cpu的`core_cookie`。在遍历过程从当前遍历的逻辑cpu中选择接下来执行的任务，若这个任务的优先级是目前为止选出来的优先级最高的任务，则保存下来。<u>遍历过程中还会考虑更新逻辑cpu的rq时间，可以参照注释内容简单理解，细节以后补充。</u>
+
+
 
 #### `__switch_to_asm`函数
 
