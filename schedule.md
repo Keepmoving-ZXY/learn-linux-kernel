@@ -258,7 +258,7 @@ asmlinkage __visible void __sched schedule(void)
         if (!max || prio_less(max, p, fi_before))
             max = p;
     }
-    
+
     cookie = rq->core->core_cookie = max->core_cookie;
 ```
 
@@ -363,7 +363,6 @@ asmlinkage __visible void __sched schedule(void)
 
         resched_curr(rq_i);
     }
-
 ```
 
 虽然在上边的逻辑中已经为从属于某个物理cpu的所有逻辑cpu选择了新的要执行的任务，但是这些逻辑cpu目前可能还无法感知这个变化，这个`for`循环遍历所有逻辑cpu，通过调用`resched_curr`函数并传入逻辑cpu的rq，通知这个逻辑cpu需要让新选择的任务抢占当前执行的任务以保持逻辑cpu中执行任务的`core_cookie`完全一致。在通知之前需要考虑这几种情况：1).未能给某个逻辑cpu选择下一个执行的任务，这个cpu可能处于不可用状态，此时填过这个cpu，2).若上次运行`pick_next_task`时没有强制某个逻辑cpu运行idle task但是本次执行却有这个要求，则调用CFS的`task_vruntime_update`函数更新cfs_rq的`min_vruntime_fi`字段（这里忽略这个字段的含义），3).若正在遍历的逻辑cpu为执行`pick_next_task`函数的逻辑cpu，这个cpu已经知道要使用新的任务替换正在执行的任务，不需要额外通知，4).若某个逻辑cpu中正在运行的任务和新选择的任务相同同样不需要额外通知。
@@ -378,7 +377,85 @@ out:
     return next;
 ```
 
+`out_set_next`标签中执行`set_next_task`函数，这个函数调用即将运行任务关联的调度类的`set_next_task`方法。`out`标签中在调用`pick_next_task`函数的cpu强制运行idle task的时候调用`queue_core_balance`函数注册一个回调函数，这个回调函数是`sched_core_balance`函数，当进行任务负载均衡的时候会调用此函数，这里忽略`sched_core_balance`函数的内容。
 
+#### `__pick_next_task`函数
+
+```c
+/*
+ * Pick up the highest-prio task:
+ */
+static inline struct task_struct *
+__pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	const struct sched_class *class;
+	struct task_struct *p;
+
+	/*
+	 * Optimization: we know that if all tasks are in the fair class we can
+	 * call that function directly, but only if the @prev task wasn't of a
+	 * higher scheduling class, because otherwise those lose the
+	 * opportunity to pull in more work from other CPUs.
+	 */
+	if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
+		   rq->nr_running == rq->cfs.h_nr_running)) {
+
+		p = pick_next_task_fair(rq, prev, rf);
+		if (unlikely(p == RETRY_TASK))
+			goto restart;
+
+		/* Assume the next prioritized class is idle_sched_class */
+		if (!p) {
+			put_prev_task(rq, prev);
+			p = pick_next_task_idle(rq);
+		}
+
+		return p;
+	}
+
+restart:
+	put_prev_task_balance(rq, prev, rf);
+
+	for_each_class(class) {
+		p = class->pick_next_task(rq);
+		if (p)
+			return p;
+	}
+
+	BUG(); /* The idle class should always have a runnable task. */
+}
+
+```
+
+如果rq中运行的所有任务都是由CFS来接管、CFS比被抢占任务关联的调度类优先级更高，那么调用`pick_next_task_fair`函数选择接下来运行的任务，如果无法找到接下来运行的任务则选择一个idle task任务运行并且对即将被抢占的任务调用`put_prev_task`函数，在`put_prev_task`函数中会调用即将被抢占的任务关联的调度类的`put_prev_task`方法。当`pick_next_task_fair`返回`RETRY_TASK`时，调用`put_prev_task_balance`函数进行任务负载均衡以明确接下来需要运行的任务、遍历每个调度类选出接下来运行的任务。
+
+#### `put_prev_task_balance`函数
+
+```c
+static void put_prev_task_balance(struct rq *rq, struct task_struct *prev,
+				  struct rq_flags *rf)
+{
+#ifdef CONFIG_SMP
+	const struct sched_class *class;
+	/*
+	 * We must do the balancing pass before put_prev_task(), such
+	 * that when we release the rq->lock the task is in the same
+	 * state as before we took rq->lock.
+	 *
+	 * We can terminate the balance pass as soon as we know there is
+	 * a runnable task of @class priority or higher.
+	 */
+	for_class_range(class, prev->sched_class, &idle_sched_class) {
+		if (class->balance(rq, prev, rf))
+			break;
+	}
+#endif
+
+	put_prev_task(rq, prev);
+}
+```
+
+从被抢占任务的调度类开始向优先级低的调度类遍历，遍历过程中调度每个调度类的`balance`方法进行任务负载均衡寻找接下来运行的任务（忽略任务负载均衡相关的内容），然后对即将抢占的任务执行`put_prev_task`函数，这个函数会调用任务关联调度类的`put_prev_task`方法执行任务被抢占前的调度类内部更新操作。
 
 #### `__switch_to_asm`函数
 
