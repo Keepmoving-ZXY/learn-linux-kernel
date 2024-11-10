@@ -131,6 +131,150 @@ asmlinkage __visible void __sched schedule(void)
 
 忽略`sched_submit_work`以及`submit_update_worker`两个函数，这个函数循环调用`__schedule`函数直到当前运行的任务没有标记`TIF_NEED_RESCHED`标志，在执行`__schedule`函数过程中要暂时进程任务抢占。注意到这里使用了一个`while`循环而非调用一次，这是考虑到优先级更高的任务抢占马上要执行的任务这种情况，即新的任务马上要开始执行但优先级更高的任务到来，内核将新的任务重新设置`TIF_NEED_RESCHED`标志，这个时候如果不继续进行循环将会导致优先级更高的任务得不到执行。接下来关注`__schedule`函数。
 
+#### `__schedule`函数
+
+```c
+    cpu = smp_processor_id();
+    rq = cpu_rq(cpu);
+    prev = rq->curr;
+
+    schedule_debug(prev, !!sched_mode);
+
+    if (sched_feat(HRTICK) || sched_feat(HRTICK_DL))
+        hrtick_clear(rq);
+
+    local_irq_disable();
+    rcu_note_context_switch(!!sched_mode);
+```
+
+忽略`schedule_debug`、`rcu_note_context_switch`函数中的内容，这些代码禁用中断、停止rq中高精度定时器运行，在执行任务切换过程中高精度定时器到期触发的函数可能会对任务切换过程造成干扰，所以要停止高精度定时器。
+
+```c
+    /*
+     * Make sure that signal_pending_state()->signal_pending() below
+     * can't be reordered with __set_current_state(TASK_INTERRUPTIBLE)
+     * done by the caller to avoid the race with signal_wake_up():
+     *
+     * __set_current_state(@state)        signal_wake_up()
+     * schedule()                  set_tsk_thread_flag(p, TIF_SIGPENDING)
+     *                      wake_up_state(p, state)
+     *   LOCK rq->lock                LOCK p->pi_state
+     *   smp_mb__after_spinlock()            smp_mb__after_spinlock()
+     *     if (signal_pending_state())        if (p->state & @state)
+     *
+     * Also, the membarrier system call requires a full memory barrier
+     * after coming from user-space, before storing to rq->curr.
+     */
+    rq_lock(rq, &rf);
+    smp_mb__after_spinlock();
+
+    /* Promote REQ to ACT */
+    rq->clock_update_flags <<= 1;
+    update_rq_clock(rq);
+```
+
+读写操作乱序可能会导致任务状态检测先于任务状态设置发生，这可能会导致`__schedule`函数与`signal_wake_up`函数产生冲突，所以在获取rq锁之后使用添加内存屏障保证读写之间的顺序（`smp_mb__after_spinlock`）。更新rq的时间并且标记rq中的时间更新操作已经执行。
+
+```c
+    switch_count = &prev->nivcsw;
+
+    /*
+     * We must load prev->state once (task_struct::state is volatile), such
+     * that we form a control dependency vs deactivate_task() below.
+     */
+    prev_state = READ_ONCE(prev->__state);
+    if (!(sched_mode & SM_MASK_PREEMPT) && prev_state) {
+        if (signal_pending_state(prev_state, prev)) {
+            WRITE_ONCE(prev->__state, TASK_RUNNING);
+        } else {
+            prev->=
+                (prev_state & TASK_UNINTERRUPTIBLE) &&
+                !(prev_state & TASK_NOLOAD) &&
+                !(prev_state & TASK_FROZEN);
+
+            if (prev->sched_contributes_to_load)
+                rq->nr_uninterruptible++;
+
+            /*
+             * __schedule()            ttwu()
+             *   prev_state = prev->state;    if (p->on_rq && ...)
+             *   if (prev_state)            goto out;
+             *     p->on_rq = 0;          smp_acquire__after_ctrl_dep();
+             *                  p->state = TASK_WAKING
+             *
+             * Where __schedule() and ttwu() have matching control dependencies.
+             *
+             * After this, schedule() must not care about p->state any more.
+             */
+            deactivate_task(rq, prev, DEQUEUE_SLEEP | DEQUEUE_NOCLOCK);
+
+            if (prev->in_iowait) {
+                atomic_inc(&rq->nr_iowait);
+                delayacct_blkio_start();
+            }
+        }
+        switch_count = &prev->nvcsw;
+    }
+```
+
+在将被抢占的任务没有处于正在运行状态、禁止任务抢占的情况下，若任务有待处理的信号则将任务设置为正在运行状态，否则这个任务是不可中断的任务。不可被中断的任务含义是此时任务处于休眠状态并且还不能被信号唤醒，当一个任务在执行磁盘io或者DMA操作时任务不可中断，忽略`prev->in_iowait`为真时执行的代码，此时若任务对系统负载有影响则更新rq中不可中断任务计数器，此时任务虽然不可中断但是依然处于睡眠状态，调用`deactivate_task`函数将任务从rq中移除，`deactivate_task`函数的具体流程在`task_wake_up.md`文件中记录。
+
+```c
+    next = pick_next_task(rq, prev, &rf);
+    clear_tsk_need_resched(prev);
+    clear_preempt_need_resched();
+#ifdef CONFIG_SCHED_DEBUG
+    rq->last_seen_need_resched_ns = 0;
+#endif
+```
+
+调用`pick_next_task`函数选择接下来运行的任务，这个函数的流程在后边详细记录，随后清空被抢占任务的`TIF_NEED_RESCHED`标记、清空运行这些代码的cpu上的`PREEMPT_NEED_RESCHED`标记。
+
+```c
+    if (likely(prev != next)) {
+        rq->nr_switches++;
+        /*
+         * RCU users of rcu_dereference(rq->curr) may not see
+         * changes to task_struct made by pick_next_task().
+         */
+        RCU_INIT_POINTER(rq->curr, next);
+        /*
+         * The membarrier system call requires each architecture
+         * to have a full memory barrier after updating
+         * rq->curr, before returning to user-space.
+         *
+         * Here are the schemes providing that barrier on the
+         * various architectures:
+         * - mm ? switch_mm() : mmdrop() for x86, s390, sparc, PowerPC.
+         *   switch_mm() rely on membarrier_arch_switch_mm() on PowerPC.
+         * - finish_lock_switch() for weakly-ordered
+         *   architectures where spin_unlock is a full barrier,
+         * - switch_to() for arm64 (weakly-ordered, spin_unlock
+         *   is a RELEASE barrier),
+         */
+        ++*switch_count;
+
+        migrate_disable_switch(rq, prev);
+        psi_account_irqtime(rq, prev, next);
+        psi_sched_switch(prev, next, !task_on_rq_queued(prev));
+
+        trace_sched_switch(sched_mode & SM_MASK_PREEMPT, prev, next, prev_state);
+
+        /* Also unlocks the rq: */
+        rq = context_switch(rq, prev, next, &rf);
+    } else {
+        rq->clock_update_flags &= ~(RQCF_ACT_SKIP|RQCF_REQ_SKIP);
+
+        rq_unpin_lock(rq, &rf);
+        __balance_callbacks(rq);
+        raw_spin_rq_unlock_irq(rq);
+    }
+```
+
+当即将运行的任务与被抢占的任务相同时，忽略`rq_unpin_lock`函数，更新rq的`clock_update_flags`来表示rq的时间相关字段已经更新，调用任务负载均衡功能相关的回调函数、释放rq锁并且恢复中断。
+
+当即将运行的任务与被抢占任务不同是一个任务时，首先使用`RCU`机制更新rq正在运行的任务为即将运行的任务、递增`switch_count`、`nr_switches`等统计字段，调用`migrate_disable_switch`函数禁止任务在cpu之间移动，调用`context_switch`执行任务切换。忽略`psi_account_irqtime`、`psi_sched_switch`、`trace_sched_switch`函数内容，在后边详细记录`migrate_disable_switch`、`context_switch`函数内容。
+
 #### `pick_next_task`函数
 
 这个函数是开启[core scheduling](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html)特性之后的`pick_next_task`函数实现，这个实现比不启用`core scheduling`特性的实现要复杂许多，其中一个主要的概念是core cookie。每个任务的task_struct结构中都有一个叫做core_cookie的字段，这个字段存储一个数值，只有具有相同的core_cookie字段值的任务才能够在同一个物理cpu之中执行，这样可以防止一部分的侧信道攻击。
@@ -388,43 +532,42 @@ out:
 static inline struct task_struct *
 __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
-	const struct sched_class *class;
-	struct task_struct *p;
+    const struct sched_class *class;
+    struct task_struct *p;
 
-	/*
-	 * Optimization: we know that if all tasks are in the fair class we can
-	 * call that function directly, but only if the @prev task wasn't of a
-	 * higher scheduling class, because otherwise those lose the
-	 * opportunity to pull in more work from other CPUs.
-	 */
-	if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
-		   rq->nr_running == rq->cfs.h_nr_running)) {
+    /*
+     * Optimization: we know that if all tasks are in the fair class we can
+     * call that function directly, but only if the @prev task wasn't of a
+     * higher scheduling class, because otherwise those lose the
+     * opportunity to pull in more work from other CPUs.
+     */
+    if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
+           rq->nr_running == rq->cfs.h_nr_running)) {
 
-		p = pick_next_task_fair(rq, prev, rf);
-		if (unlikely(p == RETRY_TASK))
-			goto restart;
+        p = pick_next_task_fair(rq, prev, rf);
+        if (unlikely(p == RETRY_TASK))
+            goto restart;
 
-		/* Assume the next prioritized class is idle_sched_class */
-		if (!p) {
-			put_prev_task(rq, prev);
-			p = pick_next_task_idle(rq);
-		}
+        /* Assume the next prioritized class is idle_sched_class */
+        if (!p) {
+            put_prev_task(rq, prev);
+            p = pick_next_task_idle(rq);
+        }
 
-		return p;
-	}
+        return p;
+    }
 
 restart:
-	put_prev_task_balance(rq, prev, rf);
+    put_prev_task_balance(rq, prev, rf);
 
-	for_each_class(class) {
-		p = class->pick_next_task(rq);
-		if (p)
-			return p;
-	}
+    for_each_class(class) {
+        p = class->pick_next_task(rq);
+        if (p)
+            return p;
+    }
 
-	BUG(); /* The idle class should always have a runnable task. */
+    BUG(); /* The idle class should always have a runnable task. */
 }
-
 ```
 
 如果rq中运行的所有任务都是由CFS来接管、CFS比被抢占任务关联的调度类优先级更高，那么调用`pick_next_task_fair`函数选择接下来运行的任务，如果无法找到接下来运行的任务则选择一个idle task任务运行并且对即将被抢占的任务调用`put_prev_task`函数，在`put_prev_task`函数中会调用即将被抢占的任务关联的调度类的`put_prev_task`方法。当`pick_next_task_fair`返回`RETRY_TASK`时，调用`put_prev_task_balance`函数进行任务负载均衡以明确接下来需要运行的任务、遍历每个调度类选出接下来运行的任务。
@@ -433,29 +576,53 @@ restart:
 
 ```c
 static void put_prev_task_balance(struct rq *rq, struct task_struct *prev,
-				  struct rq_flags *rf)
+                  struct rq_flags *rf)
 {
 #ifdef CONFIG_SMP
-	const struct sched_class *class;
-	/*
-	 * We must do the balancing pass before put_prev_task(), such
-	 * that when we release the rq->lock the task is in the same
-	 * state as before we took rq->lock.
-	 *
-	 * We can terminate the balance pass as soon as we know there is
-	 * a runnable task of @class priority or higher.
-	 */
-	for_class_range(class, prev->sched_class, &idle_sched_class) {
-		if (class->balance(rq, prev, rf))
-			break;
-	}
+    const struct sched_class *class;
+    /*
+     * We must do the balancing pass before put_prev_task(), such
+     * that when we release the rq->lock the task is in the same
+     * state as before we took rq->lock.
+     *
+     * We can terminate the balance pass as soon as we know there is
+     * a runnable task of @class priority or higher.
+     */
+    for_class_range(class, prev->sched_class, &idle_sched_class) {
+        if (class->balance(rq, prev, rf))
+            break;
+    }
 #endif
 
-	put_prev_task(rq, prev);
+    put_prev_task(rq, prev);
 }
 ```
 
 从被抢占任务的调度类开始向优先级低的调度类遍历，遍历过程中调度每个调度类的`balance`方法进行任务负载均衡寻找接下来运行的任务（忽略任务负载均衡相关的内容），然后对即将抢占的任务执行`put_prev_task`函数，这个函数会调用任务关联调度类的`put_prev_task`方法执行任务被抢占前的调度类内部更新操作。
+
+#### `migrate_disable_switch`函数
+
+```c
+static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+{
+    if (likely(!p->migration_disabled))
+        return;
+
+    if (p->cpus_ptr != &p->cpus_mask)
+        return;
+
+    /*
+     * Violates locking rules! see comment in __do_set_cpus_allowed().
+     */
+    __do_set_cpus_allowed(p, cpumask_of(rq->cpu), SCA_MIGRATE_DISABLE);
+}
+```
+
+这个函数调用`__do_set_cpus_allowed`保证任务`p`无法调度到rq所属cpu之中，第二个参数指定任务在cpu转移过程中排除的cpu，第三个参数为禁用任务转移的标记。在此之前还要进行一些基本情况判断，当没有禁用任务`p`在cpu之间移动时、当任务`p`和其他的任务共享同一组cpu时（`p->cpu_ptr != &p->cpus_mask`）都不进行任何操作。
+
+
+
+
 
 #### `__switch_to_asm`函数
 
