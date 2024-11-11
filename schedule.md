@@ -620,9 +620,97 @@ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
 
 这个函数调用`__do_set_cpus_allowed`保证任务`p`无法调度到rq所属cpu之中，第二个参数指定任务在cpu转移过程中排除的cpu，第三个参数为禁用任务转移的标记。在此之前还要进行一些基本情况判断，当没有禁用任务`p`在cpu之间移动时、当任务`p`和其他的任务共享同一组cpu时（`p->cpu_ptr != &p->cpus_mask`）都不进行任何操作。
 
+#### `context_switch`函数
 
+```c
+/*
+ * context_switch - switch to the new MM and the new thread's register state.
+ */
+static __always_inline struct rq *
+context_switch(struct rq *rq, struct task_struct *prev,
+           struct task_struct *next, struct rq_flags *rf)
+{
+    prepare_task_switch(rq, prev, next);
 
+    /*
+     * For paravirt, this is coupled with an exit in switch_to to
+     * combine the page table reload and the switch backend into
+     * one hypercall.
+     */
+    arch_start_context_switch(prev);
 
+    /*
+     * kernel -> kernel   lazy + transfer active
+     *   user -> kernel   lazy + mmgrab() active
+     *
+     * kernel ->   user   switch + mmdrop() active
+     *   user ->   user   switch
+     */
+    if (!next->mm) {                                // to kernel
+        enter_lazy_tlb(prev->active_mm, next);
+
+        next->active_mm = prev->active_mm;
+        if (prev->mm)                           // from user
+            mmgrab(prev->active_mm);
+        else
+            prev->active_mm = NULL;
+    } else {                                        // to user
+        membarrier_switch_mm(rq, prev->active_mm, next->mm);
+        /*
+         * sys_membarrier() requires an smp_mb() between setting
+         * rq->curr / membarrier_switch_mm() and returning to userspace.
+         *
+         * The below provides this either through switch_mm(), or in
+         * case 'prev->active_mm == next->mm' through
+         * finish_task_switch()'s mmdrop().
+         */
+        switch_mm_irqs_off(prev->active_mm, next->mm, next);
+        lru_gen_use_mm(next->mm);
+
+        if (!prev->mm) {                        // from kernel
+            /* will mmdrop() in finish_task_switch(). */
+            rq->prev_mm = prev->active_mm;
+            prev->active_mm = NULL;
+        }
+    }
+
+    rq->clock_update_flags &= ~(RQCF_ACT_SKIP|RQCF_REQ_SKIP);
+
+    prepare_lock_switch(rq, next, rf);
+
+    /* Here we just switch the register state and the stack. */
+    switch_to(prev, next, prev);
+    barrier();
+
+    return finish_task_switch(prev);
+}
+```
+
+`prepare_task_switch`函数与`finish_task_switch`函数对应，`prepare_task_switch`执行进程抢占前的准备工作，后边详细记录`prepare_task_switch`函数的具体流程。接下来执行的函数`arch_start_context_switch`是处理器要求在进程抢占之前调用的函数，这个函数有的处理器没有实现（例如`x86_64`）、有的处理器有自己的实现。
+
+当新运行的任务为内核线程（`next->mm`为空），执行`enter_lazy_tlb`函数跳过重新向`TLB`缓存之中写入新任务的页表项，之所以能够跳过这一步是因为在linux中运行的所有的任务（包含内核线程、用户态进程、进程中的线程）使用的内核空间都是相同的并且内核线程不需要访问用户态内存空间，所以复用被抢占任务的`TLB`缓存是没问题的。这里详细介绍`mm`与`active_mm`之间的关系，`mm`为一个进程的虚拟地址空间，对于进程而言`active_mm`以及`mm`字段的值都是相同的，对于内核线程而言`active_mm`直接引用为上一个运行的进程的虚拟地址空间。当被抢占的任务为进程，即将运行的内核线程直接引用进程的虚拟地址空间，递增`mm`的引用计数；当被抢占的任务、新运行的任务都是内核线程，使用`next->active_mm = prev->active_mm`来引用之前运行进程的虚拟地址空间。
+
+当新运行的任务为进程时，将rq的`membarrier_state`设置为进程虚拟地址空间的`membarrier_state`状态，`membarrier_state`为`membarrier`系统调用中的内容，具体含义见这个系统调用的说明文档。`switch_mm_irqs_off`函数负责处理在任务切换时`TLB`以及内存管理相关结构的切换，这个函数的具体内容在后边详细记录。`lru_gen_use_mm`函数标记新任务的虚拟地址空间中的内存最近被使用过，尽量其中的内存页换出操作。当被抢占的任务为内核线程时，在rq中保存内核线程引用的虚拟地址空间，在`finish_task_switch`将会解除对这个用户态空间的引用。
+
+#### `prepare_task_switch`函数
+
+```c
+static inline void
+prepare_task_switch(struct rq *rq, struct task_struct *prev,
+            struct task_struct *next)
+{
+    kcov_prepare_switch(prev);
+    sched_info_switch(rq, prev, next);
+    perf_event_task_sched_out(prev, next);
+    rseq_preempt(prev);
+    fire_sched_out_preempt_notifiers(prev, next);
+    kmap_local_sched_out();
+    prepare_task(next);
+    prepare_arch_switch(next);
+}
+```
+
+忽略`kcov_prepare_switch`、`sched_info_switch`、`perf_event_task_sched_out`、`kmap_local_sched_out`函数，`rseq_preempt`函数为任务添加`RSEQ`机制专用的任务被抢占的标识、设置进程恢复之后进行提醒，提醒的作用是进程已经恢复让`RSEQ`中的代码片段重新执行。`fire_sched_out_preempt_notifiers`用于提醒抢占事件的监听者，具体方法是调用点监听者指定的`sched_out`方法。`prepare_task`函数将即将运行进程的`on_cpu`字段设置为1，使用了`WRITE_ONCE`保证了缓存一致性。`prepare_arch_switch`为处理器特定的函数，在某些处理器中要求在进行进程抢占时调用此函数，在其他的处理器中没有实现（例如`x86_64`）。
 
 #### `__switch_to_asm`函数
 
