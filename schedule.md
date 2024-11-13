@@ -818,8 +818,6 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 
 当被抢占的任务状态为`TASK_DEAD`，调用调度类的`task_dead`方法、递减此任务的栈空间、递减`RCU`机制中栈空间的引用计数，若栈空间的引用计数在递减之后为0则释放它。
 
-
-
 #### `__switch_to_asm`函数
 
 ```c
@@ -886,3 +884,119 @@ SYM_FUNC_END(__switch_to_asm)
 接下来执行的6条`popq`指令从任务b的栈中弹出6个寄存器的值，这些值并不是在任务b抢占任务a时入栈的值，而是在任务c抢占任务b的时候入栈的值。在任务c抢占任务b时将这几个寄存器的值压入栈中，随后任务b失去CPU资源暂停执行，随着时间的流逝任务b得到在CPU 3资源可以继续运行，此时CPU 3使用的栈空间为任务b的栈空间，所以此时是从b的栈空间中出栈任务b被任务c抢占时压入的寄存器的值。
 
 最后执行`__switch_to`函数，当函数返回之后任务a已经失去CPU资源暂停运行，任务b开始恢复运行。
+
+#### `__switch_to`函数
+
+```c
+__no_kmsan_checks
+__visible __notrace_funcgraph struct task_struct *
+__switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+{
+	struct thread_struct *prev = &prev_p->thread;
+	struct thread_struct *next = &next_p->thread;
+	struct fpu *prev_fpu = &prev->fpu;
+	int cpu = smp_processor_id();
+
+	WARN_ON_ONCE(IS_ENABLED(CONFIG_DEBUG_ENTRY) &&
+		     this_cpu_read(hardirq_stack_inuse));
+
+	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+		switch_fpu_prepare(prev_fpu, cpu);
+
+	/* We must save %fs and %gs before load_TLS() because
+	 * %fs and %gs may be cleared by load_TLS().
+	 *
+	 * (e.g. xen_load_tls())
+	 */
+	save_fsgs(prev_p);
+
+	/*
+	 * Load TLS before restoring any segments so that segment loads
+	 * reference the correct GDT entries.
+	 */
+	load_TLS(next, cpu);
+
+	/*
+	 * Leave lazy mode, flushing any hypercalls made here.  This
+	 * must be done after loading TLS entries in the GDT but before
+	 * loading segments that might reference them.
+	 */
+	arch_end_context_switch(next_p);
+
+	/* Switch DS and ES.
+	 *
+	 * Reading them only returns the selectors, but writing them (if
+	 * nonzero) loads the full descriptor from the GDT or LDT.  The
+	 * LDT for next is loaded in switch_mm, and the GDT is loaded
+	 * above.
+	 *
+	 * We therefore need to write new values to the segment
+	 * registers on every context switch unless both the new and old
+	 * values are zero.
+	 *
+	 * Note that we don't need to do anything for CS and SS, as
+	 * those are saved and restored as part of pt_regs.
+	 */
+	savesegment(es, prev->es);
+	if (unlikely(next->es | prev->es))
+		loadsegment(es, next->es);
+
+	savesegment(ds, prev->ds);
+	if (unlikely(next->ds | prev->ds))
+		loadsegment(ds, next->ds);
+
+	x86_fsgsbase_load(prev, next);
+
+	x86_pkru_load(prev, next);
+
+	/*
+	 * Switch the PDA and FPU contexts.
+	 */
+	this_cpu_write(current_task, next_p);
+	this_cpu_write(cpu_current_top_of_stack, task_top_of_stack(next_p));
+
+	switch_fpu_finish();
+
+	/* Reload sp0. */
+	update_task_stack(next_p);
+
+	switch_to_extra(prev_p, next_p);
+
+	if (static_cpu_has_bug(X86_BUG_SYSRET_SS_ATTRS)) {
+		/*
+		 * AMD CPUs have a misfeature: SYSRET sets the SS selector but
+		 * does not update the cached descriptor.  As a result, if we
+		 * do SYSRET while SS is NULL, we'll end up in user mode with
+		 * SS apparently equal to __USER_DS but actually unusable.
+		 *
+		 * The straightforward workaround would be to fix it up just
+		 * before SYSRET, but that would slow down the system call
+		 * fast paths.  Instead, we ensure that SS is never NULL in
+		 * system call context.  We do this by replacing NULL SS
+		 * selectors at every context switch.  SYSCALL sets up a valid
+		 * SS, so the only way to get NULL is to re-enter the kernel
+		 * from CPL 3 through an interrupt.  Since that can't happen
+		 * in the same task as a running syscall, we are guaranteed to
+		 * context switch between every interrupt vector entry and a
+		 * subsequent SYSRET.
+		 *
+		 * We read SS first because SS reads are much faster than
+		 * writes.  Out of caution, we force SS to __KERNEL_DS even if
+		 * it previously had a different non-NULL value.
+		 */
+		unsigned short ss_sel;
+		savesegment(ss, ss_sel);
+		if (ss_sel != __KERNEL_DS)
+			loadsegment(ss, __KERNEL_DS);
+	}
+
+	/* Load the Intel cache allocation PQR MSR. */
+	resctrl_sched_in(next_p);
+
+	return prev_p;
+}
+```
+
+`prev_p`为被抢占的任务、`next_p`为即将运行的任务，这个函数首先调用`switch_fpu_prepare`函数在`prev_p`中保存其运行时浮点数相关寄存器的值，记录`prev_p`最后运行所在的cpu。`load_TLS`函数从`next_p`之中加载线程本地数据，这个函数执行的时候会清空`FS`、`GS`寄存器的值，所以在执行此函数之前要先使用`save_fsgs`函数保存`prev_p`运行时两个寄存器的值。有的处理器定义了在完成任务切换时执行的操作，`arch_end_context_switch`函数执行这些操作。接下来是`ES`和`DS`寄存器的操作，这两个寄存器为数据段、扩展段寄存器，保存`prev_p`运行时两个寄存器的值，将`next_p`中保存的两个寄存器的值恢复到对应的寄存器之中。接下来从`next_p`之中恢复`FS`、`GS`寄存器的值，对应的函数是`x86_fsgsbase_load`，`prev_p`运行时这两个寄存器的值已经保存，所以此处可以直接覆盖。
+
+忽略`x86_pkru_load`函数、AMD处理器问题修复，`switch_to_extra`更新进程调试寄存器、io权限位图、推测执行相关的内容，最后调用的`resctrl_sched_in`函数与intel cpu的资源控制功能有关。这些内容涉及到cpu体系结构相关的内容，这里就不展开记录了。
