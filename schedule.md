@@ -690,7 +690,9 @@ context_switch(struct rq *rq, struct task_struct *prev,
 
 当新运行的任务为内核线程（`next->mm`为空），执行`enter_lazy_tlb`函数跳过重新向`TLB`缓存之中写入新任务的页表项，之所以能够跳过这一步是因为在linux中运行的所有的任务（包含内核线程、用户态进程、进程中的线程）使用的内核空间都是相同的并且内核线程不需要访问用户态内存空间，所以复用被抢占任务的`TLB`缓存是没问题的。这里详细介绍`mm`与`active_mm`之间的关系，`mm`为一个进程的虚拟地址空间，对于进程而言`active_mm`以及`mm`字段的值都是相同的，对于内核线程而言`active_mm`直接引用为上一个运行的进程的虚拟地址空间。当被抢占的任务为进程，即将运行的内核线程直接引用进程的虚拟地址空间，递增`mm`的引用计数；当被抢占的任务、新运行的任务都是内核线程，使用`next->active_mm = prev->active_mm`来引用之前运行进程的虚拟地址空间。
 
-当新运行的任务为进程时，将rq的`membarrier_state`设置为进程虚拟地址空间的`membarrier_state`状态，`membarrier_state`为`membarrier`系统调用中的内容，具体含义见这个系统调用的说明文档。`switch_mm_irqs_off`函数负责处理在任务切换时`TLB`以及内存管理相关结构的切换，这个函数的具体内容在后边详细记录。`lru_gen_use_mm`函数标记新任务的虚拟地址空间中的内存最近被使用过，尽量其中的内存页换出操作。当被抢占的任务为内核线程时，在rq中保存内核线程引用的虚拟地址空间，在`finish_task_switch`将会解除对这个用户态空间的引用。
+当新运行的任务为进程时，将rq的`membarrier_state`设置为进程虚拟地址空间的`membarrier_state`状态，`membarrier_state`为`membarrier`系统调用中的内容，具体含义见这个系统调用的说明文档。`switch_mm_irqs_off`函数负责处理在任务切换时`TLB`以及内存管理相关结构的切换。`lru_gen_use_mm`函数标记新任务的虚拟地址空间中的内存最近被使用过，尽量其中的内存页换出操作。当被抢占的任务为内核线程时，在rq中保存内核线程引用的虚拟地址空间，在`finish_task_switch`将会解除对这个用户态空间的引用。
+
+上边的代码中提到了`switch_mm_irqs_off`函数，这个函数用于切换内存管理相关的内容，这里简要介绍这个函数的内容。若任务切换不会导致`TLB`缓存的内存页对应地址空间不变，则进一步确定`TLB`缓存中内容是否需要更新，在`TLB`缓存的内存页对应地址空间中添加当前运行cpu的使用标记；若发生变化在之前的地址空间中清除当前cpu的使用标记、在新的地址空间中添加当前cpu的使用标记，选择新的`ASID`（用于标识新的地址空间），在选择新的`ASID`的时候可能会要求更新`TLB`缓存中的内容。无论哪种情况，一旦要求更新`TLB`缓存中的内容，调用`load_new_mm_cr3`触发`TLB`缓存更新。在后一种情况中还会调用`cond_mitigation`函数，这个函数用于处理`Spectre`漏洞。
 
 #### `prepare_task_switch`函数
 
@@ -711,6 +713,112 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 ```
 
 忽略`kcov_prepare_switch`、`sched_info_switch`、`perf_event_task_sched_out`、`kmap_local_sched_out`函数，`rseq_preempt`函数为任务添加`RSEQ`机制专用的任务被抢占的标识、设置进程恢复之后进行提醒，提醒的作用是进程已经恢复让`RSEQ`中的代码片段重新执行。`fire_sched_out_preempt_notifiers`用于提醒抢占事件的监听者，具体方法是调用点监听者指定的`sched_out`方法。`prepare_task`函数将即将运行进程的`on_cpu`字段设置为1，使用了`WRITE_ONCE`保证了缓存一致性。`prepare_arch_switch`为处理器特定的函数，在某些处理器中要求在进行进程抢占时调用此函数，在其他的处理器中没有实现（例如`x86_64`）。
+
+#### `switch_to`宏
+
+```c
+#define switch_to(prev, next, last)                    \
+do {                                    \
+    ((last) = __switch_to_asm((prev), (next)));            \
+} while (0)
+```
+
+这个宏调用了`__switch_to_asm`函数，这个函数返回被抢占的任务，后边详细记录`__switch_to_asm`函数的具体流程。
+
+#### `finish_task_switch`函数
+
+```c
+static struct rq *finish_task_switch(struct task_struct *prev)
+    __releases(rq->lock)
+{
+    struct rq *rq = this_rq();
+    struct mm_struct *mm = rq->prev_mm;
+    unsigned int prev_state;
+
+    /*
+     * The previous task will have left us with a preempt_count of 2
+     * because it left us after:
+     *
+     *    schedule()
+     *      preempt_disable();            // 1
+     *      __schedule()
+     *        raw_spin_lock_irq(&rq->lock)    // 2
+     *
+     * Also, see FORK_PREEMPT_COUNT.
+     */
+    if (WARN_ONCE(preempt_count() != 2*PREEMPT_DISABLE_OFFSET,
+              "corrupted preempt_count: %s/%d/0x%x\n",
+              current->comm, current->pid, preempt_count()))
+        preempt_count_set(FORK_PREEMPT_COUNT);
+
+    rq->prev_mm = NULL;
+
+    /*
+     * A task struct has one reference for the use as "current".
+     * If a task dies, then it sets TASK_DEAD in tsk->state and calls
+     * schedule one last time. The schedule call will never return, and
+     * the scheduled task must drop that reference.
+     *
+     * We must observe prev->state before clearing prev->on_cpu (in
+     * finish_task), otherwise a concurrent wakeup can get prev
+     * running on another CPU and we could rave with its RUNNING -> DEAD
+     * transition, resulting in a double drop.
+     */
+    prev_state = READ_ONCE(prev->__state);
+    vtime_task_switch(prev);
+    perf_event_task_sched_in(prev, current);
+    finish_task(prev);
+    tick_nohz_task_switch();
+    finish_lock_switch(rq);
+    finish_arch_post_lock_switch();
+    kcov_finish_switch(current);
+    /*
+     * kmap_local_sched_out() is invoked with rq::lock held and
+     * interrupts disabled. There is no requirement for that, but the
+     * sched out code does not have an interrupt enabled section.
+     * Restoring the maps on sched in does not require interrupts being
+     * disabled either.
+     */
+    kmap_local_sched_in();
+
+    fire_sched_in_preempt_notifiers(current);
+    /*
+     * When switching through a kernel thread, the loop in
+     * membarrier_{private,global}_expedited() may have observed that
+     * kernel thread and not issued an IPI. It is therefore possible to
+     * schedule between user->kernel->user threads without passing though
+     * switch_mm(). Membarrier requires a barrier after storing to
+     * rq->curr, before returning to userspace, so provide them here:
+     *
+     * - a full memory barrier for {PRIVATE,GLOBAL}_EXPEDITED, implicitly
+     *   provided by mmdrop(),
+     * - a sync_core for SYNC_CORE.
+     */
+    if (mm) {
+        membarrier_mm_sync_core_before_usermode(mm);
+        mmdrop_sched(mm);
+    }
+    if (unlikely(prev_state == TASK_DEAD)) {
+        if (prev->sched_class->task_dead)
+            prev->sched_class->task_dead(prev);
+
+        /* Task is done with its stack. */
+        put_task_stack(prev);
+
+        put_task_struct_rcu_user(prev);
+    }
+
+    return rq;
+}
+```
+
+这个函数首先判断抢占计数是否为2，若不为2强制设置为2，这是因为在执行`schedule`函数开始到现在会调用两次`preempt_disable`函数，每次调用这个函数会递增抢占计数。`vtime_task_switch`函数涉及到任务和cpu的时间统计、`perf_event_task_sched_in`涉及性记录任务调入到cpu事件的性能记录、`tick_nohz_task_switch`函数涉及到一种特殊的定时器，忽略这几个函数中的内容。`finish_task`函数将被抢占任务的`on_cpu`字段设置为0并且保证`RELEASE`语义的内存同步，`finish_lock_switch`函数触发rq中任务负载均衡相关的回调函数、释放rq锁并恢复中断，`finish_arch_post_lock_switch`在`x86_64`架构中是一个空函数。
+
+忽略`kcov_finish_switch`、`kmap_local_sched_in`函数内容，提醒即将运行任务的事件监听者此任务被调度cpu执行（在`fire_sched_in_preempt_notifiers`中调用监听者注册的`sched_in`方法）。若被抢占任务为一个进程，考虑是否在返回用户态之前执行`SERIALIZE`指令，若新旧任务的地址空间不同或者新任务地址空间的内存屏障状态中包含`PRIVATE_EXPEDITED_SYNC_CORE`标记则跳过执行（忽略这个标记的含义），其他的情况需要执行`SERIALIZE`指令（在intel的指令集手册中，`SERIALIZE`指令的含义为`Before the next instruction is fetched and executed, the SERIALIZE instruction ensures that all modifications to flags, registers, and memory by previous instructions are completed, draining all buffered writes to memory`，即在这个指令之前素有指令都会得到执行，这是为了保证在返回用户态之前所有内核态的操作全部执行完成），随后取消对被抢占任务的地址空间的引用。
+
+当被抢占的任务状态为`TASK_DEAD`，调用调度类的`task_dead`方法、递减此任务的栈空间、递减`RCU`机制中栈空间的引用计数，若栈空间的引用计数在递减之后为0则释放它。
+
+
 
 #### `__switch_to_asm`函数
 
