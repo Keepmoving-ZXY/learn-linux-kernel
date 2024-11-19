@@ -52,44 +52,43 @@ static void task_fork_fair(struct task_struct *p)
  */
 static void update_curr(struct cfs_rq *cfs_rq)
 {
-	struct sched_entity *curr = cfs_rq->curr;
-	u64 now = rq_clock_task(rq_of(cfs_rq));
-	u64 delta_exec;
+    struct sched_entity *curr = cfs_rq->curr;
+    u64 now = rq_clock_task(rq_of(cfs_rq));
+    u64 delta_exec;
 
-	if (unlikely(!curr))
-		return;
+    if (unlikely(!curr))
+        return;
 
-	delta_exec = now - curr->exec_start;
-	if (unlikely((s64)delta_exec <= 0))
-		return;
+    delta_exec = now - curr->exec_start;
+    if (unlikely((s64)delta_exec <= 0))
+        return;
 
-	curr->exec_start = now;
+    curr->exec_start = now;
 
-	if (schedstat_enabled()) {
-		struct sched_statistics *stats;
+    if (schedstat_enabled()) {
+        struct sched_statistics *stats;
 
-		stats = __schedstats_from_se(curr);
-		__schedstat_set(stats->exec_max,
-				max(delta_exec, stats->exec_max));
-	}
+        stats = __schedstats_from_se(curr);
+        __schedstat_set(stats->exec_max,
+                max(delta_exec, stats->exec_max));
+    }
 
-	curr->sum_exec_runtime += delta_exec;
-	schedstat_add(cfs_rq->exec_clock, delta_exec);
+    curr->sum_exec_runtime += delta_exec;
+    schedstat_add(cfs_rq->exec_clock, delta_exec);
 
-	curr->vruntime += calc_delta_fair(delta_exec, curr);
-	update_min_vruntime(cfs_rq);
+    curr->vruntime += calc_delta_fair(delta_exec, curr);
+    update_min_vruntime(cfs_rq);
 
-	if (entity_is_task(curr)) {
-		struct task_struct *curtask = task_of(curr);
+    if (entity_is_task(curr)) {
+        struct task_struct *curtask = task_of(curr);
 
-		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
-		cgroup_account_cputime(curtask, delta_exec);
-		account_group_exec_runtime(curtask, delta_exec);
-	}
+        trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
+        cgroup_account_cputime(curtask, delta_exec);
+        account_group_exec_runtime(curtask, delta_exec);
+    }
 
-	account_cfs_rq_runtime(cfs_rq, delta_exec);
+    account_cfs_rq_runtime(cfs_rq, delta_exec);
 }
-
 ```
 
 这里假设`curr`实体对应的为一个任务，这个函数用于更新正在运行任务的时间统计，`delta_exec`指的是上次更新与这次更新的时间间隔，也就是两个更新期间进程运行的时间，任务的`exec_start`字段保存最近一次统计更新的时间，任务的`sum_exec_runtime`字段含义为累计任务累计执行时间。得到进程的执行时间之后，使用`calc_delta_fair`函数结合任务执行时间、任务权重计算出来任务虚拟运行时间的增量，更新任务的虚拟运行时间。调用`update_min_vruntime`函数更新CFS中任务所在rq对的虚拟运行时间基准，即更新rq的`min_vruntime`字段。`calc_delta_fair`、`update_min_vruntime`函数的内容在后边详细记录。
@@ -104,13 +103,11 @@ static void update_curr(struct cfs_rq *cfs_rq)
  */
 static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 {
-	if (unlikely(se->load.weight != NICE_0_LOAD))
-		delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+    if (unlikely(se->load.weight != NICE_0_LOAD))
+        delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
 
-	return delta;
+    return delta;
 }
-
-
 ```
 
 这里假设实体`se`对应的是一个任务，CFS之中`nice`值为0的任务比较特殊，它的虚拟运行时间和实际运行时间是相同的，不需要进行任何缩放，所以当任务的`nice`值为0的时候直接把运行时间当作虚拟运行时间。对于`nice`不为0的任务则需要对运行时间进行缩放得到对应对的虚拟运行时间，这个缩放操作主要在`__calc_delta`函数中进行，这个函数计算`delta * NICE_0_LOAD / load_of_task`，接下来记录这个函数的流程。
@@ -132,32 +129,30 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
  */
 static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
 {
-	u64 fact = scale_load_down(weight);
-	u32 fact_hi = (u32)(fact >> 32);
-	int shift = WMULT_SHIFT;
-	int fs;
+    u64 fact = scale_load_down(weight);
+    u32 fact_hi = (u32)(fact >> 32);
+    int shift = WMULT_SHIFT;
+    int fs;
 
-	__update_inv_weight(lw);
+    __update_inv_weight(lw);
 
-	if (unlikely(fact_hi)) {
-		fs = fls(fact_hi);
-		shift -= fs;
-		fact >>= fs;
-	}
+    if (unlikely(fact_hi)) {
+        fs = fls(fact_hi);
+        shift -= fs;
+        fact >>= fs;
+    }
 
-	fact = mul_u32_u32(fact, lw->inv_weight);
+    fact = mul_u32_u32(fact, lw->inv_weight);
 
-	fact_hi = (u32)(fact >> 32);
-	if (fact_hi) {
-		fs = fls(fact_hi);
-		shift -= fs;
-		fact >>= fs;
-	}
+    fact_hi = (u32)(fact >> 32);
+    if (fact_hi) {
+        fs = fls(fact_hi);
+        shift -= fs;
+        fact >>= fs;
+    }
 
-	return mul_u64_u32_shr(delta_exec, fact, shift);
+    return mul_u64_u32_shr(delta_exec, fact, shift);
 }
-
-
 ```
 
 - [ ] 补充这个函数的流程；
@@ -167,33 +162,101 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 ```c
 static void update_min_vruntime(struct cfs_rq *cfs_rq)
 {
-	struct sched_entity *curr = cfs_rq->curr;
-	struct rb_node *leftmost = rb_first_cached(&cfs_rq->tasks_timeline);
+    struct sched_entity *curr = cfs_rq->curr;
+    struct rb_node *leftmost = rb_first_cached(&cfs_rq->tasks_timeline);
 
-	u64 vruntime = cfs_rq->min_vruntime;
+    u64 vruntime = cfs_rq->min_vruntime;
 
-	if (curr) {
-		if (curr->on_rq)
-			vruntime = curr->vruntime;
-		else
-			curr = NULL;
-	}
+    if (curr) {
+        if (curr->on_rq)
+            vruntime = curr->vruntime;
+        else
+            curr = NULL;
+    }
 
-	if (leftmost) { /* non-empty tree */
-		struct sched_entity *se = __node_2_se(leftmost);
+    if (leftmost) { /* non-empty tree */
+        struct sched_entity *se = __node_2_se(leftmost);
 
-		if (!curr)
-			vruntime = se->vruntime;
-		else
-			vruntime = min_vruntime(vruntime, se->vruntime);
-	}
+        if (!curr)
+            vruntime = se->vruntime;
+        else
+            vruntime = min_vruntime(vruntime, se->vruntime);
+    }
 
-	/* ensure we never gain time by being placed backwards. */
-	u64_u32_store(cfs_rq->min_vruntime,
-		      max_vruntime(cfs_rq->min_vruntime, vruntime));
+    /* ensure we never gain time by being placed backwards. */
+    u64_u32_store(cfs_rq->min_vruntime,
+              max_vruntime(cfs_rq->min_vruntime, vruntime));
 }
 ```
 
 这里假设调度实体对应的是任务，在cfs_rq之中任务按照任务的`vruntime`的值存放在红黑树之中，红黑树中最左侧的任务为`vruntime`最小的任务。这个函数首先在当前运行任务、红黑树中最左侧任务的`vruntime`之中选择最小的值，然后选择当前cfs_rq之中的基准虚拟时间与刚刚选择出来的虚拟时间之中的最大值为当前cfs_rq之中的最新基准虚拟时间。
 
 这里有一些特殊情况需要考虑，例如当cfs_rq之中没有任务的时候`curr`为空、红黑树为空、当前任务正在被调度过程中，导致无法在cfs_rq之中当前正在执行任务、红黑树最左侧任务中选出来一个最小的虚拟运行时间，此时只考虑前者或者后者的虚拟运行时间参与到最后的最大值比较中去。
+
+#### `place_entity`函数
+
+```c
+static void
+place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+{
+	u64 vruntime = cfs_rq->min_vruntime;
+
+	/*
+	 * The 'current' period is already promised to the current tasks,
+	 * however the extra weight of the new task will slow them down a
+	 * little, place the new task so that it fits in the slot that
+	 * stays open at the end.
+	 */
+	if (initial && sched_feat(START_DEBIT))
+		vruntime += sched_vslice(cfs_rq, se);
+
+	/* sleeps up to a single latency don't count. */
+	if (!initial) {
+		unsigned long thresh;
+
+		if (se_is_idle(se))
+			thresh = sysctl_sched_min_granularity;
+		else
+			thresh = sysctl_sched_latency;
+
+		/*
+		 * Halve their sleep time's effect, to allow
+		 * for a gentler effect of sleepers:
+		 */
+		if (sched_feat(GENTLE_FAIR_SLEEPERS))
+			thresh >>= 1;
+
+		vruntime -= thresh;
+	}
+
+	/*
+	 * Pull vruntime of the entity being placed to the base level of
+	 * cfs_rq, to prevent boosting it if placed backwards.
+	 * However, min_vruntime can advance much faster than real time, with
+	 * the extreme being when an entity with the minimal weight always runs
+	 * on the cfs_rq. If the waking entity slept for a long time, its
+	 * vruntime difference from min_vruntime may overflow s64 and their
+	 * comparison may get inversed, so ignore the entity's original
+	 * vruntime in that case.
+	 * The maximal vruntime speedup is given by the ratio of normal to
+	 * minimal weight: scale_load_down(NICE_0_LOAD) / MIN_SHARES.
+	 * When placing a migrated waking entity, its exec_start has been set
+	 * from a different rq. In order to take into account a possible
+	 * divergence between new and prev rq's clocks task because of irq and
+	 * stolen time, we take an additional margin.
+	 * So, cutting off on the sleep time of
+	 *     2^63 / scale_load_down(NICE_0_LOAD) ~ 104 days
+	 * should be safe.
+	 */
+	if (entity_is_long_sleeper(se))
+		se->vruntime = vruntime;
+	else
+		se->vruntime = max_vruntime(se->vruntime, vruntime);
+}
+
+
+```
+
+假设这里的调度实体对应的是一个任务，这个函数计算并设置任务的虚拟运行时间。在任务模拟的虚拟运行时间为cfs_rq中的基准虚拟运行时间情况下，如果这个任务是新创建的任务、开启了`START_DEBIT`特性，为任务的虚拟运行时间增加一个时间片，该时间片由`sched_vslice`函数计算得到，后边详细记录此函数的流程。若任务刚刚被唤醒，则考虑减小任务的虚拟运行时间以增加任务运行的机会，根据任务是否是空闲任务、是否开启了`GENTLE_FAIR_SLEEPERS`确定虚拟运行时间减小的程度。若任务休眠时间很长则直接将任务虚拟运行时间直接设置为此函数中计算出来的`vruntime`，其他情况下取本函数中计算出来的虚拟运行时间、任务初始设置的虚拟运行时间（与当前正在运行任务的虚拟运行时间相同）。
+
+在最后的流程中涉及到如何量化任务休眠时间很长这种情况，结合最后一个`if`分支前的注释内容理解。
