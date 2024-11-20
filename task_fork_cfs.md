@@ -199,64 +199,133 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 {
-	u64 vruntime = cfs_rq->min_vruntime;
+    u64 vruntime = cfs_rq->min_vruntime;
 
-	/*
-	 * The 'current' period is already promised to the current tasks,
-	 * however the extra weight of the new task will slow them down a
-	 * little, place the new task so that it fits in the slot that
-	 * stays open at the end.
-	 */
-	if (initial && sched_feat(START_DEBIT))
-		vruntime += sched_vslice(cfs_rq, se);
+    /*
+     * The 'current' period is already promised to the current tasks,
+     * however the extra weight of the new task will slow them down a
+     * little, place the new task so that it fits in the slot that
+     * stays open at the end.
+     */
+    if (initial && sched_feat(START_DEBIT))
+        vruntime += sched_vslice(cfs_rq, se);
 
-	/* sleeps up to a single latency don't count. */
-	if (!initial) {
-		unsigned long thresh;
+    /* sleeps up to a single latency don't count. */
+    if (!initial) {
+        unsigned long thresh;
 
-		if (se_is_idle(se))
-			thresh = sysctl_sched_min_granularity;
-		else
-			thresh = sysctl_sched_latency;
+        if (se_is_idle(se))
+            thresh = sysctl_sched_min_granularity;
+        else
+            thresh = sysctl_sched_latency;
 
-		/*
-		 * Halve their sleep time's effect, to allow
-		 * for a gentler effect of sleepers:
-		 */
-		if (sched_feat(GENTLE_FAIR_SLEEPERS))
-			thresh >>= 1;
+        /*
+         * Halve their sleep time's effect, to allow
+         * for a gentler effect of sleepers:
+         */
+        if (sched_feat(GENTLE_FAIR_SLEEPERS))
+            thresh >>= 1;
 
-		vruntime -= thresh;
-	}
+        vruntime -= thresh;
+    }
 
-	/*
-	 * Pull vruntime of the entity being placed to the base level of
-	 * cfs_rq, to prevent boosting it if placed backwards.
-	 * However, min_vruntime can advance much faster than real time, with
-	 * the extreme being when an entity with the minimal weight always runs
-	 * on the cfs_rq. If the waking entity slept for a long time, its
-	 * vruntime difference from min_vruntime may overflow s64 and their
-	 * comparison may get inversed, so ignore the entity's original
-	 * vruntime in that case.
-	 * The maximal vruntime speedup is given by the ratio of normal to
-	 * minimal weight: scale_load_down(NICE_0_LOAD) / MIN_SHARES.
-	 * When placing a migrated waking entity, its exec_start has been set
-	 * from a different rq. In order to take into account a possible
-	 * divergence between new and prev rq's clocks task because of irq and
-	 * stolen time, we take an additional margin.
-	 * So, cutting off on the sleep time of
-	 *     2^63 / scale_load_down(NICE_0_LOAD) ~ 104 days
-	 * should be safe.
-	 */
-	if (entity_is_long_sleeper(se))
-		se->vruntime = vruntime;
-	else
-		se->vruntime = max_vruntime(se->vruntime, vruntime);
+    /*
+     * Pull vruntime of the entity being placed to the base level of
+     * cfs_rq, to prevent boosting it if placed backwards.
+     * However, min_vruntime can advance much faster than real time, with
+     * the extreme being when an entity with the minimal weight always runs
+     * on the cfs_rq. If the waking entity slept for a long time, its
+     * vruntime difference from min_vruntime may overflow s64 and their
+     * comparison may get inversed, so ignore the entity's original
+     * vruntime in that case.
+     * The maximal vruntime speedup is given by the ratio of normal to
+     * minimal weight: scale_load_down(NICE_0_LOAD) / MIN_SHARES.
+     * When placing a migrated waking entity, its exec_start has been set
+     * from a different rq. In order to take into account a possible
+     * divergence between new and prev rq's clocks task because of irq and
+     * stolen time, we take an additional margin.
+     * So, cutting off on the sleep time of
+     *     2^63 / scale_load_down(NICE_0_LOAD) ~ 104 days
+     * should be safe.
+     */
+    if (entity_is_long_sleeper(se))
+        se->vruntime = vruntime;
+    else
+        se->vruntime = max_vruntime(se->vruntime, vruntime);
 }
-
-
 ```
 
 假设这里的调度实体对应的是一个任务，这个函数计算并设置任务的虚拟运行时间。在任务模拟的虚拟运行时间为cfs_rq中的基准虚拟运行时间情况下，如果这个任务是新创建的任务、开启了`START_DEBIT`特性，为任务的虚拟运行时间增加一个时间片，该时间片由`sched_vslice`函数计算得到，后边详细记录此函数的流程。若任务刚刚被唤醒，则考虑减小任务的虚拟运行时间以增加任务运行的机会，根据任务是否是空闲任务、是否开启了`GENTLE_FAIR_SLEEPERS`确定虚拟运行时间减小的程度。若任务休眠时间很长则直接将任务虚拟运行时间直接设置为此函数中计算出来的`vruntime`，其他情况下取本函数中计算出来的虚拟运行时间、任务初始设置的虚拟运行时间（与当前正在运行任务的虚拟运行时间相同）。
 
-在最后的流程中涉及到如何量化任务休眠时间很长这种情况，结合最后一个`if`分支前的注释内容理解。
+在最后的流程中涉及到如何量化任务休眠时间很长这种情况，结合最后一个`if`分支前的注释内容理解。在不考虑溢出的情况下直接使用`max_vruntime`函数得到任务的虚拟运行时间，这个函数将两个时间做一个减法计算并判断结果是否小于0得到最大值。在考虑溢出的情况下则会直接给出一个错误的结果，面对这个问题内核考虑在什么情况下会发生溢出。最快的虚拟运行时间增加速度为`nice`值为0的任务带来的，当这样的任务运行大约104天时任务的虚拟运行时间接近最大值并且即将发生溢出，这个时候如何直接进行减法操作进行比较很容易得到错误的结果，104天就是内核对休眠很长时间的量化。对于这种情况内核直接将人物的虚拟运行时间设置为计算得到的虚拟运行时间以避免潜在错误。
+
+#### `sched_vslice`函数
+
+```c
+/*
+ * We calculate the vruntime slice of a to-be-inserted task.
+ *
+ * vs = s/w
+ */
+static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+    return calc_delta_fair(sched_slice(cfs_rq, se), se);
+}
+```
+
+假设这里的调度实体对应的是一个任务，这个函数计算任务的虚拟时间片，具体思路是计算一个调度周期中这个任务获取到的运行时间并转换成虚拟运行时间。这个函数的一个用途是增加新创建任务的虚拟运行时间，防止新创建任务抢占cfs_rq中正在运行的任务。获取一个调度周期内任务获取到的时间由`sched_slice`函数给出，将这个时间转换成虚拟运行时间由`calc_delta_fair`函数给出，`calc_delta_fair`函数流程在前边记录过，接下来记录`sched_slice`函数的流程。
+
+#### `sched_slice`函数
+
+```c
+/*
+ * We calculate the wall-time slice from the period by taking a part
+ * proportional to the weight.
+ *
+ * s = p*P[w/rw]
+ */
+static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+    unsigned int nr_running = cfs_rq->nr_running;
+    struct sched_entity *init_se = se;
+    unsigned int min_gran;
+    u64 slice;
+
+    if (sched_feat(ALT_PERIOD))
+        nr_running = rq_of(cfs_rq)->cfs.h_nr_running;
+
+    slice = __sched_period(nr_running + !se->on_rq);
+
+    for_each_sched_entity(se) {
+        struct load_weight *load;
+        struct load_weight lw;
+        struct cfs_rq *qcfs_rq;
+
+        qcfs_rq = cfs_rq_of(se);
+        load = &qcfs_rq->load;
+
+        if (unlikely(!se->on_rq)) {
+            lw = qcfs_rq->load;
+
+            update_load_add(&lw, se->load.weight);
+            load = &lw;
+        }
+        slice = __calc_delta(slice, se->load.weight, load);
+    }
+
+    if (sched_feat(BASE_SLICE)) {
+        if (se_is_idle(init_se) && !sched_idle_cfs_rq(cfs_rq))
+            min_gran = sysctl_sched_idle_min_granularity;
+        else
+            min_gran = sysctl_sched_min_granularity;
+
+        slice = max_t(u64, slice, min_gran);
+    }
+
+    return slice;
+}
+```
+
+`__sched_period`函数返回一个调度周期对应的时间，这个时间的具体计算方式如下：如果cfs_rq之中运行的任务数量比较多，保证在平均意义下每个任务都获得最小的执行时间；其他情况下使用系统默认的调度周期对应的时间。接下来涉及到调度实体的层级结构，每个调度实体有自己的父实体，父实体也可能会有自己的父实体，从正在运行任务的实体开始验证子-父关系不断寻找父实体直到寻找到根实体（没有父实体），对于这个过程中寻找到的每个实体：若实体在cfs_rq之中则根据实体的权重、实体所在的cfs_rq中总权重对调度周期对应的事件进行缩放；其他情况下需要将实体的权重添加到cfs_rq的总权重之中，随后使用前一种情况中的处理方式。完成时间缩放之后得到了让任务的在这个调度周期中的运行时间。若启用了`BASE_SLICE`功能，为此任务的运行时间设置一个下限：若任务是一个空闲任务并且队列是一个空闲队列，下限设置为`sysctl_sched_idle_min_granularity`，其他情况下设置为`sysctl_sched_min_granularity`。
+
+这里提到了调度实体的层级结构，这里提供一个层级结构的例子。在Linux桌面中可能会有多个会话、每个会话中启动shell、在shell中运行进程，这样就形成了一个从进程到会话的层级结构，就会产生调度实体之间的父-子关系。
