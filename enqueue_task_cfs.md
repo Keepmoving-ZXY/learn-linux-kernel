@@ -232,56 +232,86 @@ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se
 ```c
 static __always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
-		  unsigned long load, unsigned long runnable, int running)
+          unsigned long load, unsigned long runnable, int running)
 {
-	u64 delta;
+    u64 delta;
 
-	delta = now - sa->last_update_time;
-	/*
-	 * This should only happen when time goes backwards, which it
-	 * unfortunately does during sched clock init when we swap over to TSC.
-	 */
-	if ((s64)delta < 0) {
-		sa->last_update_time = now;
-		return 0;
-	}
+    delta = now - sa->last_update_time;
+    /*
+     * This should only happen when time goes backwards, which it
+     * unfortunately does during sched clock init when we swap over to TSC.
+     */
+    if ((s64)delta < 0) {
+        sa->last_update_time = now;
+        return 0;
+    }
 
-	/*
-	 * Use 1024ns as the unit of measurement since it's a reasonable
-	 * approximation of 1us and fast to compute.
-	 */
-	delta >>= 10;
-	if (!delta)
-		return 0;
+    /*
+     * Use 1024ns as the unit of measurement since it's a reasonable
+     * approximation of 1us and fast to compute.
+     */
+    delta >>= 10;
+    if (!delta)
+        return 0;
 
-	sa->last_update_time += delta << 10;
+    sa->last_update_time += delta << 10;
 
-	/*
-	 * running is a subset of runnable (weight) so running can't be set if
-	 * runnable is clear. But there are some corner cases where the current
-	 * se has been already dequeued but cfs_rq->curr still points to it.
-	 * This means that weight will be 0 but not running for a sched_entity
-	 * but also for a cfs_rq if the latter becomes idle. As an example,
-	 * this happens during idle_balance() which calls
-	 * update_blocked_averages().
-	 *
-	 * Also see the comment in accumulate_sum().
-	 */
-	if (!load)
-		runnable = running = 0;
+    /*
+     * running is a subset of runnable (weight) so running can't be set if
+     * runnable is clear. But there are some corner cases where the current
+     * se has been already dequeued but cfs_rq->curr still points to it.
+     * This means that weight will be 0 but not running for a sched_entity
+     * but also for a cfs_rq if the latter becomes idle. As an example,
+     * this happens during idle_balance() which calls
+     * update_blocked_averages().
+     *
+     * Also see the comment in accumulate_sum().
+     */
+    if (!load)
+        runnable = running = 0;
 
-	/*
-	 * Now we know we crossed measurement unit boundaries. The *_avg
-	 * accrues by two steps:
-	 *
-	 * Step 1: accumulate *_sum since last_update_time. If we haven't
-	 * crossed period boundaries, finish.
-	 */
-	if (!accumulate_sum(delta, sa, load, runnable, running))
-		return 0;
+    /*
+     * Now we know we crossed measurement unit boundaries. The *_avg
+     * accrues by two steps:
+     *
+     * Step 1: accumulate *_sum since last_update_time. If we haven't
+     * crossed period boundaries, finish.
+     */
+    if (!accumulate_sum(delta, sa, load, runnable, running))
+        return 0;
 
-	return 1;
+    return 1;
 }
 ```
 
-这个函数计算load_sum、runnable_sum、util_sum三个指标，这里先记录这三个指标的计算过程，然后解释这三个指标的含义。
+这个函数计算load_sum、runnable_sum、util_sum三个指标，这里先记录这三个指标的计算过程，然后解释这三个指标的含义。这个函数将时间按照1024ns为一个周期划分，`delta`为实体两个统计更新之间的时间差，这个时间差可能会出现在多个周期之中，第一个周期为距离现在最远的周期，最后一个周期为`now`所在的周期，在第一个周期的时间部分并不一定会占用整个周期，最后一个周期的时间也并不一定会占用整个周期。这里假设时间差出现在p个完整的周期，加上两个特殊的周期，一共出现了在p+2个周期之中，将在每个周期中的时间设置为u_i，其中有p个u_i为1024而额外两个u_i的值小于1024，u_0为在第一个周期的时间占用，u_{p+1}为在最后一个周期的时间占用。接下来将这些p+2个u_i当作p+2个几何级数的系数进行求和，具体计算方式为`u_0 + u_1*y + u_2*y^2 + u_3*y^3 + ...`，y的取值满足y^32为0.5。由于y的取值小于1，使用几何级数求和意味着在结果中距离现在越近的周期对应的u_i在结果中的比例越高，距离现在越远的周期对应的u_i在结果中的比例越低，例如u_0的系数为1而u_31的系数为0.5。
+
+在`task_fork_cfs.md`之中记录`__calc_delta`函数的时候提到过内核无法直接进行浮点数计算，因此这里的几何级数求和也无法直接进行计算，内核解决这个问题的方法是选择y使得`y^32`为0.5、在内核源码中保存{`y`,`y^2`,...,`y^31`}的数值，这个时候若要计算`u_i * y^p`，需要考虑`p`是否大于32：如果`p < 32`，则`y^p`可以直接获取；如果 `p >= 32`，则可以使用如下方法：假设 `p = m * 32 + n`，那么`y^p = (y^{32})^m * y^n` 由于 `y^{32} = 1/2`，所以`y^p = (1/2)^m * y^n`（因为`n < 32`所以`y^n` 的值可以直接获取）。
+
+上述过程只能计算出来单个`y^n`的值，在几何级数求和公式中还存在多个不同技术结果的求和，如下所示：
+
+$$
+\sum_{n=1}^{p-1} y^n
+$$
+
+求和公式的计算可以转换为：
+
+$$
+等式1：\sum_{n=1}^{p-1} y^n = \sum_{n=1}^{∞}y^n - \sum_{n=p}^{∞}y^n - 1
+$$
+
+其中：
+
+$$
+等式2：\sum_{n=1}^{∞}y^n = \frac{1}{1 - y}
+$$
+
+$$
+等式3：\sum_{n=p}^{∞}y^n = \frac{1}{1 - y} - \sum_{n = 1}^{p - 1} y^n (等比数列求和) = \frac{y^p}{1 - y} 
+$$
+
+等式2来源于极限计算，综合等式1、2、3得到：
+
+$$
+等式4： \sum_{n=1}^{p-1} y^n = \frac{1}{1 - y} - \frac{1}{1 - y} * y^p - 1
+$$
