@@ -225,7 +225,7 @@ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se
 }
 ```
 
-这个函数用于更新实体`se`的平均负载，首先调用`___update_load_sum`函数计算实体`se`的load_sum、runnable_sum、util_sum这三个指标的值，这三个指标之中load_sum基于可运行时间计算（包含在cfs_rq的时间、cpu上执行的时间），util_sum基于在cpu上的执行时间计算，runnable_sum同样基于任务的可运行时间计算但是计算细节与load_sum的计算有所不同，这三个sum指标为关于实体两次更新三个指标时间差的几何级数之和，具体计算方式在`___update_load_sum`函数流程记录之中说明。更新完{load、runnable、util}_sum之后调用`__update_load_avg`计算{load,runnable, util}_avg三个指标，这三个指标为三个对应几何级数之后的均值，具体计算方式在这个函数的流程记录中说明。最后调用`cfs_se_util_change`函数标记`util_avg`已经更新过。
+这个函数用于更新实体`se`的平均负载，首先调用`___update_load_sum`函数计算实体`se`的`load_sum`、`runnable_sum`、`util_sum`这三个指标的值，这三个指标之中load_sum基于可运行时间计算（包含在cfs_rq的时间、cpu上执行的时间），`util_sum`基于在cpu上的执行时间计算，`runnable_sum`同样基于任务的可运行时间计算但是计算细节与`load_sum`的计算有所不同，这三个sum指标为关于实体两次更新三个指标时间差的几何级数之和，具体计算方式在`___update_load_sum`函数流程记录之中说明。更新完``{load、runnable、util}_sum`之后调用`__update_load_avg`计算`{load,runnable, util}_avg`三个指标，这三个指标为三个对应几何级数之后的均值，具体计算方式在这个函数的流程记录中说明。最后调用`cfs_se_util_change`函数标记`util_avg`已经更新过。
 
 ### `___update_load_sum`函数
 
@@ -284,11 +284,9 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 }
 ```
 
-这个函数计算load_sum、runnable_sum、util_sum三个指标，这里先记录这三个指标的计算过程，然后解释这三个指标的含义。这个函数将时间按照1024ns为一个周期划分，`delta`为实体两个统计更新之间的时间差，这个时间差可能会出现在多个周期之中，第一个周期为距离现在最远的周期，最后一个周期为`now`所在的周期，在第一个周期的时间部分并不一定会占用整个周期，最后一个周期的时间也并不一定会占用整个周期。这里假设时间差出现在p个完整的周期，加上两个特殊的周期，一共出现了在p+2个周期之中，将在每个周期中的时间设置为u_i，其中有p个u_i为1024而额外两个u_i的值小于1024，u_0为在第一个周期的时间占用，u_{p+1}为在最后一个周期的时间占用。接下来将这些p+2个u_i当作p+2个几何级数的系数进行求和，具体计算方式为`u_0 + u_1*y + u_2*y^2 + u_3*y^3 + ...`，y的取值满足y^32为0.5。由于y的取值小于1，使用几何级数求和意味着在结果中距离现在越近的周期对应的u_i在结果中的比例越高，距离现在越远的周期对应的u_i在结果中的比例越低，例如u_0的系数为1而u_31的系数为0.5。
+这个函数计算`load_sum`、`runnable_sum`、`util_sum`三个指标，这里先记录这三个指标的计算过程，然后解释这三个指标的含义。这个函数将时间按照1024 ns为一个周期划分，`delta`为实体两个统计更新之间的时间差，这个时间差可能会出现在多个周期之中，第一个周期为距离现在最远的周期，最后一个周期为`now`所在的周期，在第一个周期的时间部分并不一定会占用整个周期，最后一个周期的时间也并不一定会占用整个周期。这里假设时间差出现在p个完整的周期，加上两个特殊的周期，一共出现了在p+2个周期之中，将在每个周期中的时间设置为`u_i`，其中有p个`u_i`为1024而额外两个`u_i`的值小于1024，`u_0`为在第一个周期的时间占用，`u_{p+1}`为在最后一个周期的时间占用。接下来将这些`p+2`个`u_i`当作`p+2`个几何级数的系数进行求和，具体计算方式为`u_0 + u_1*y + u_2*y^2 + u_3*y^3 + ...`，y的取值满足`y^32`为0.5。由于`y`的取值小于1，使用几何级数求和意味着在结果中距离现在越近的周期对应的u_i在结果中的比例越高，距离现在越远的周期对应的u_i在结果中的比例越低，例如`u_0`的系数为1而`u_31`的系数为0.5。
 
-在`task_fork_cfs.md`之中记录`__calc_delta`函数的时候提到过内核无法直接进行浮点数计算，因此这里的几何级数求和也无法直接进行计算，内核解决这个问题的方法是选择y使得`y^32`为0.5、在内核源码中保存{`y`,`y^2`,...,`y^31`}的数值，这个时候若要计算`u_i * y^p`，需要考虑`p`是否大于32：如果`p < 32`，则`y^p`可以直接获取；如果 `p >= 32`，则可以使用如下方法：假设 `p = m * 32 + n`，那么`y^p = (y^{32})^m * y^n` 由于 `y^{32} = 1/2`，所以`y^p = (1/2)^m * y^n`（因为`n < 32`所以`y^n` 的值可以直接获取）。
-
-上述过程只能计算出来单个`y^n`的值，在几何级数求和公式中还存在多个不同技术结果的求和，如下所示：
+在`task_fork_cfs.md`之中记录`__calc_delta`函数的时候提到过内核无法直接进行浮点数计算，因此这里的几何级数求和也无法直接进行计算，内核解决这个问题的方法是选择y使得`y^32`为0.5、在内核源码中保存{`y`,`y^2`,...,`y^31`}的数值，这个时候若要计算`u_i * y^p`，需要考虑`p`是否大于32：如果`p < 32`，则`y^p`可以直接获取；如果 `p >= 32`，则可以使用如下方法：假设 `p = m * 32 + n`，那么`y^p = (y^{32})^m * y^n` 由于 `y^{32} = 1/2`，所以`y^p = (1/2)^m * y^n`（因为`n < 32`所以`y^n` 的值可以直接获取）。上述过程只能计算出来单个`y^n`的值，在几何级数求和公式中还存在多个不同技术结果的求和，如下所示：
 
 $$
 \sum_{n=1}^{p-1} y^n
@@ -327,3 +325,120 @@ $$
 $$
 等式6： \sum_{n=1}^{p-1} y^n = \frac{1}{1 - y} - \frac{1}{1 - y} * y^p - 1
 $$
+接下来关注这个函数的流程，这个函数进行一些判断最后调用`accumulate_sum`进行几何级数求和计算。这个函数首先计算两次更新之间的时间差存入`delta`之中，若`delta`小于0或者`delta`跨越的时间不足一个周期直接退出函数，其他情况下继续执行。接下来的代码涉及到`load`、`runnable`、`running`三个参数：当实体`se`在cfs_rq之中时`load`为1；当实体对应一个任务并且实体在cfs_rq之中时`runnable`为1，当实体对饮一个线程组并且实习在cfs_rq之中时`runnable`为任务组中可运行的任务数量；当实体对应的任务正在运行时`running`为1。当实体对应任务时，`load`和`runnable`的含义是一致的，即任务是否处于可运行状态；当实体对应任务组时，`load`对应任务组是否处于可运行状态、`runnable`为任务组中可运行的任务，在接下来的流程之中默认实体既可以对应任务也可以对应任务组，当对应任务与任务组处理方式不同时会有特殊说明。代码注释之中提到一种特殊的情况需要处理，即当`load`为0时意味着实体不在cfs_rq之中，那么在一些情况之中可能会认为实体对应的任务正在运行中，这个时候需要纠正错误的判断。接下来调用`accumulate_sum`进行几何级数求和计算，接下来记录的函数流程就是这个函数的流程，在这个函数之中能真正看到`load_sum`、`runnable_sum`、`util_sum`的计算方式，也会明确这三个指标的含义是什么。
+
+### `accumulate_sum`函数
+
+```c
+/*
+ * Accumulate the three separate parts of the sum; d1 the remainder
+ * of the last (incomplete) period, d2 the span of full periods and d3
+ * the remainder of the (incomplete) current period.
+ *
+ *           d1          d2           d3
+ *           ^           ^            ^
+ *           |           |            |
+ *         |<->|<----------------->|<--->|
+ * ... |---x---|------| ... |------|-----x (now)
+ *
+ *                           p-1
+ * u' = (u + d1) y^p + 1024 \Sum y^n + d3 y^0
+ *                           n=1
+ *
+ *    = u y^p +					(Step 1)
+ *
+ *                     p-1
+ *      d1 y^p + 1024 \Sum y^n + d3 y^0		(Step 2)
+ *                     n=1
+ */
+static __always_inline u32
+accumulate_sum(u64 delta, struct sched_avg *sa,
+	       unsigned long load, unsigned long runnable, int running)
+{
+	u32 contrib = (u32)delta; /* p == 0 -> delta < 1024 */
+	u64 periods;
+
+	delta += sa->period_contrib;
+	periods = delta / 1024; /* A period is 1024us (~1ms) */
+
+	/*
+	 * Step 1: decay old *_sum if we crossed period boundaries.
+	 */
+	if (periods) {
+		sa->load_sum = decay_load(sa->load_sum, periods);
+		sa->runnable_sum =
+			decay_load(sa->runnable_sum, periods);
+		sa->util_sum = decay_load((u64)(sa->util_sum), periods);
+
+		/*
+		 * Step 2
+		 */
+		delta %= 1024;
+		if (load) {
+			/*
+			 * This relies on the:
+			 *
+			 * if (!load)
+			 *	runnable = running = 0;
+			 *
+			 * clause from ___update_load_sum(); this results in
+			 * the below usage of @contrib to disappear entirely,
+			 * so no point in calculating it.
+			 */
+			contrib = __accumulate_pelt_segments(periods,
+					1024 - sa->period_contrib, delta);
+		}
+	}
+	sa->period_contrib = delta;
+
+	if (load)
+		sa->load_sum += load * contrib;
+	if (runnable)
+		sa->runnable_sum += runnable * contrib << SCHED_CAPACITY_SHIFT;
+	if (running)
+		sa->util_sum += contrib << SCHED_CAPACITY_SHIFT;
+
+	return periods;
+}
+```
+
+参照这个函数前的注释，当`delta`分布在`p+2`个周期时函数执行的计算如下：
+$$
+等式7：u' = (u_{p+1} + d_1) * y^p + 1024 * \sum_{n=1}^{p} y^n + p_0
+$$
+其中$u_{p+1}$、$p_0$的含义见`___update_load_sum`函数流程记录、$d_1$的含义为之前计算出来的指标值，代码实现的时候将这个公式的计算分成了两部分，第一部分为$d1 * y^p$、第二部分为等式7之中剩余的部分，这两部分的计算都依赖于`delta`以及`periods`两个变量的值：`delta`为两次统计之间的时间差，将`delta`与上一次统计时$p_0$的值`sa->peroid_contrib`相加得到更准确的时间，之所以这样处理时因为在`___update_load_sum`函数中更新`last_update_time`时直接使用左移操作进行时间换算而忽略了这部分时间；`peroids`为`delta`分布在多少个周期之中。
+
+第一部分计算分别将任务之前计算得到的`load_sum`、`runnable_sum`、`util_sum`当作$d_1$ 计算$d_1 * y^p$，具体的计算由`delay_load`函数完成，这个函数的流程与`___update_load_sum`函数中记录的计算$u_i * y^p$的思路一致，不再详细记录`delay_load`这个函数的代码流程了。第二部分调用`__accumulate_pelt_segments`函数完成计算得到`delta`对应这段时间的几何级数求和，这个函数实现流程涉及到前边提到的等式1-6，会在后边会记录这个函数的流程。
+
+`__accumulate_pelt_segments`函数会给出`delta`对应的这段时间的几何级数之和，几何级数之和会存入到`contrib`之中，最后的三个`if`判断中的代码更新实体的三个指标，指标的更新取决于`load`、`runnable`、`running`三个参数是否为0，若为0则跳过指标更新。从这三个指标更新的代码之中可以看到：`load_sum`为实体处于可运行状态（`load`不为0）时占用时间的几何级数之和；当实体对应一个可运行任务时`runnable_sum`与`load_sum`含义一致，对应`runnable`不为0，只不过把它当作定点数然后缩放成整数；当实体对应可运行的任务组时，同样对应`runnable`不为0，``runnable_sum`为任务组中为任务组中可运行任务数量、任务组处于可运行状态时占用时间的几何级数之和两个因素的乘积，将乘积结果当作定点数随后转换成整数；`util_sum`为任务处于实体处于运行状态时占用时间的几何级数之和。
+
+最后注意到将`delta % 1024`赋值给了`sa->period_contrib`，这个对应保存本次更新时的$P_0$，在下次更新时会将下次更新时计算出来的`delta`与本次更新时计算出来的$P_0$相加作为更精确的时间，见本函数最开始部分对`delta`变量的解释。
+
+### `__accmulate_pelt_segments`函数
+
+```c
+static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
+{
+	u32 c1, c2, c3 = d3; /* y^0 == 1 */
+
+	/*
+	 * c1 = d1 y^p
+	 */
+	c1 = decay_load((u64)d1, periods);
+
+	/*
+	 *            p-1
+	 * c2 = 1024 \Sum y^n
+	 *            n=1
+	 *
+	 *              inf        inf
+	 *    = 1024 ( \Sum y^n - \Sum y^n - y^0 )
+	 *              n=0        n=p
+	 */
+	c2 = LOAD_AVG_MAX - decay_load(LOAD_AVG_MAX, periods) - 1024;
+
+	return c1 + c2 + c3;
+}
+```
+
+这个函数计算等式7之中除去$d_1 * y^p$ 之后剩余部分的和，这个函数之中`c2`的计算对应等式6，`c1`的计算对应等式7中$u_{p+1} * y^n$，涉及到幂计算的时候直接调用`delay_load`函数进行，这个函数的思路在`accumulate_sum`函数中有记录。这个函数的参数之中`periods`为`delta`分布在多少个周期之中，`d1`、`d3`分别对应`___update_load_sum`函数记录中的$u_{p+1}$、$u_0$。
