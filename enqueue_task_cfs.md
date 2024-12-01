@@ -284,10 +284,9 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 }
 ```
 
-这个函数计算`load_sum`、`runnable_sum`、`util_sum`三个指标，这里先记录这三个指标的计算过程，然后解释这三个指标的含义。这个函数将时间按照1024 ns为一个周期划分，`delta`为实体两个统计更新之间的时间差，这个时间差可能会出现在多个周期之中，第一个周期为距离现在最远的周期，最后一个周期为`now`所在的周期，在第一个周期的时间部分并不一定会占用整个周期，最后一个周期的时间也并不一定会占用整个周期。这里假设时间差出现在p个完整的周期，加上两个特殊的周期，一共出现了在p+2个周期之中，将在每个周期中的时间设置为`u_i`，其中有p个`u_i`为1024而额外两个`u_i`的值小于1024，`u_0`为在第一个周期的时间占用，`u_{p+1}`为在最后一个周期的时间占用。接下来将这些`p+2`个`u_i`当作`p+2`个几何级数的系数进行求和，具体计算方式为`u_0 + u_1*y + u_2*y^2 + u_3*y^3 + ...`，y的取值满足`y^32`为0.5。由于`y`的取值小于1，使用几何级数求和意味着在结果中距离现在越近的周期对应的u_i在结果中的比例越高，距离现在越远的周期对应的u_i在结果中的比例越低，例如`u_0`的系数为1而`u_31`的系数为0.5。
+这个函数计算`load_sum`、`runnable_sum`、`util_sum`三个指标，这里先记录这三个指标的计算过程，然后解释这三个指标的含义，前边提到的负载统计其实就是这三个指标。这个函数将时间按照1024 ns为一个周期划分，`delta`为实体两个统计更新之间的时间差，这个时间差可能会出现在多个周期之中，第一个周期为距离现在最远的周期，最后一个周期为`now`所在的周期，在第一个周期的时间部分并不一定会占用整个周期，最后一个周期的时间也并不一定会占用整个周期。这里假设时间差出现在p个完整的周期，加上两个特殊的周期，一共出现了在p+2个周期之中，将在每个周期中的时间设置$u_i$，其中有p个$u_i$为1024而额外两个$u_i$的值小于1024，$u_0$为在第一个周期的时间占用，$u_{p+1}$为在最后一个周期的时间占用。接下来将这些$p+2$个$u_i$当作$p+2$个几何级数的系数进行求和，具体计算方式为$u_0 + y_1 * y + u_2 * y^2 + u_3 * ^3+ ...$，y的取值满足$y^{32}$为0.5。由于y的取值小于1，使用几何级数求和意味着在结果中距离现在越近的周期对应的u_i在结果中的比例越高，距离现在越远的周期对应的u_i在结果中的比例越低，例如$u_0$的系数为1而$u_{31}$的系数为0.5。
 
-在`task_fork_cfs.md`之中记录`__calc_delta`函数的时候提到过内核无法直接进行浮点数计算，因此这里的几何级数求和也无法直接进行计算，内核解决这个问题的方法是选择y使得`y^32`为0.5、在内核源码中保存{`y`,`y^2`,...,`y^31`}的数值，这个时候若要计算`u_i * y^p`，需要考虑`p`是否大于32：如果`p < 32`，则`y^p`可以直接获取；如果 `p >= 32`，则可以使用如下方法：假设 `p = m * 32 + n`，那么`y^p = (y^{32})^m * y^n` 由于 `y^{32} = 1/2`，所以`y^p = (1/2)^m * y^n`（因为`n < 32`所以`y^n` 的值可以直接获取）。上述过程只能计算出来单个`y^n`的值，在几何级数求和公式中还存在多个不同技术结果的求和，如下所示：
-
+在`task_fork_cfs.md`之中记录`__calc_delta`函数的时候提到过内核无法直接进行浮点数计算，因此这里的几何级数求和也无法直接进行计算，内核解决这个问题的方法是选择y使得$y^{32}$为0.5、在内核源码中保存${y, y^2,...,y^{31}}$的数值，这个时候若要计算$u_i * y^p$，需要考虑p是否大于32：如果$p < 32$，则$y^p$可以直接获取；如果 $p > 32$，则可以使用如下方法：假设 $p = m * 32 + n$，那么$y^p = (y^{32})^m * y^n$ 由于 $y^{32} = \frac{1}{2}$，所以$y^p = (\frac{1}{2})^m * y^n$（因为$n < 32$所以$y^n$的值可以直接获取）。上述过程只能计算出来单个$y^n$的值，在几何级数求和公式中还存在多个不同技术结果的求和，如下所示：
 $$
 \sum_{n=1}^{p-1} y^n
 $$
@@ -513,3 +512,267 @@ $$
 $$
 
 `PELT_MIN_DIVIDER`代表的值对应等式8的结果，`avg->period_contrib`对应$u_0$。
+
+### `update_cfs_rq_load_avg`函数
+
+```c
+/**
+ * update_cfs_rq_load_avg - update the cfs_rq's load/util averages
+ * @now: current time, as per cfs_rq_clock_pelt()
+ * @cfs_rq: cfs_rq to update
+ *
+ * The cfs_rq avg is the direct sum of all its entities (blocked and runnable)
+ * avg. The immediate corollary is that all (fair) tasks must be attached.
+ *
+ * cfs_rq->avg is used for task_h_load() and update_cfs_share() for example.
+ *
+ * Return: true if the load decayed or we removed load.
+ *
+ * Since both these conditions indicate a changed cfs_rq->avg.load we should
+ * call update_tg_load_avg() when this function returns true.
+ */
+static inline int
+update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
+{
+	unsigned long removed_load = 0, removed_util = 0, removed_runnable = 0;
+	struct sched_avg *sa = &cfs_rq->avg;
+	int decayed = 0;
+
+	if (cfs_rq->removed.nr) {
+		unsigned long r;
+		u32 divider = get_pelt_divider(&cfs_rq->avg);
+
+		raw_spin_lock(&cfs_rq->removed.lock);
+		swap(cfs_rq->removed.util_avg, removed_util);
+		swap(cfs_rq->removed.load_avg, removed_load);
+		swap(cfs_rq->removed.runnable_avg, removed_runnable);
+		cfs_rq->removed.nr = 0;
+		raw_spin_unlock(&cfs_rq->removed.lock);
+
+		r = removed_load;
+		sub_positive(&sa->load_avg, r);
+		sub_positive(&sa->load_sum, r * divider);
+		/* See sa->util_sum below */
+		sa->load_sum = max_t(u32, sa->load_sum, sa->load_avg * PELT_MIN_DIVIDER);
+
+		r = removed_util;
+		sub_positive(&sa->util_avg, r);
+		sub_positive(&sa->util_sum, r * divider);
+		/*
+		 * Because of rounding, se->util_sum might ends up being +1 more than
+		 * cfs->util_sum. Although this is not a problem by itself, detaching
+		 * a lot of tasks with the rounding problem between 2 updates of
+		 * util_avg (~1ms) can make cfs->util_sum becoming null whereas
+		 * cfs_util_avg is not.
+		 * Check that util_sum is still above its lower bound for the new
+		 * util_avg. Given that period_contrib might have moved since the last
+		 * sync, we are only sure that util_sum must be above or equal to
+		 *    util_avg * minimum possible divider
+		 */
+		sa->util_sum = max_t(u32, sa->util_sum, sa->util_avg * PELT_MIN_DIVIDER);
+
+		r = removed_runnable;
+		sub_positive(&sa->runnable_avg, r);
+		sub_positive(&sa->runnable_sum, r * divider);
+		/* See sa->util_sum above */
+		sa->runnable_sum = max_t(u32, sa->runnable_sum,
+					      sa->runnable_avg * PELT_MIN_DIVIDER);
+
+		/*
+		 * removed_runnable is the unweighted version of removed_load so we
+		 * can use it to estimate removed_load_sum.
+		 */
+		add_tg_cfs_propagate(cfs_rq,
+			-(long)(removed_runnable * divider) >> SCHED_CAPACITY_SHIFT);
+
+		decayed = 1;
+	}
+
+	decayed |= __update_load_avg_cfs_rq(now, cfs_rq);
+	u64_u32_store_copy(sa->last_update_time,
+			   cfs_rq->last_update_time_copy,
+			   sa->last_update_time);
+	return decayed;
+}
+```
+
+这个函数用于更新cfs_rq上的`runnable_avg`、`util_avg`、`load_avg`三个指标的值。这个函数首先处理当cfs_rq之中有实体离开的情况（`cfs_rq->removed.nr`不为0），分别更新`runnable`、`util`、`load`这三个指标的`avg`以及`sum`的值，更新`avg`时直接减去因任务离开cfs_rq而减少的值均值，更新`sum`时则要减去减少的均值与指标最大值的乘积。这里需要注意的是在`sum`指标更新之后需要保证`sum`指标的最小值，如代码中的注释所说，这是因为在两次更新这些`sum`指标的时候可能会有大量的任务从cfs_rq之中移除，这就会导致cfs_rq的`avg`指标不为0但是`sum`指标为0的情况，此时需要根据`avg`指标的值来修正`sum`指标的值。当这一层之中有实体移除时，不仅仅是这一层的指标会发生变化，上层的指标也会发生变化，`add_tg_cfs_propagate`函数将被移除实体的`runnable_avg`暂存起来，在后续的流程中更高的调度层级之中传递这个变化。
+
+更新cfs_rq的`avg`指标的流程在`__update_load_avg_cfs_rq`函数之中，接下来记录这个函数的流程。
+
+### `__upate_load_avg_cfs_rq`函数
+
+```c
+int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq)
+{
+	if (___update_load_sum(now, &cfs_rq->avg,
+				scale_load_down(cfs_rq->load.weight),
+				cfs_rq->h_nr_running,
+				cfs_rq->curr != NULL)) {
+
+		___update_load_avg(&cfs_rq->avg, 1);
+		trace_pelt_cfs_tp(cfs_rq);
+		return 1;
+	}
+
+	return 0;
+}
+```
+
+这个函数之中调用的函数与`__update_load_avg_se`函数调用的函数完全一致，只不过传入的参数有所不同。调用`___update_load_sum`时`load`为cfs_rq的权重、`runnable`为cfs_rq之中可运行的任务，调用`___update_load_avg`的时候传入的是cfs_rq的指标，具体计算逻辑见前边这两个函数的流程记录。从这个函数中可以看到`___update_load_sum`、`___update_load_avg`函数既可以更新任务的指标又可以更新cfs_rq的指标，在前边记录这两个函数的流程时仅仅关注了这两种情况下`runnable`参数的不同，这里可以看到如果更新的是cfs_rq的指标`load`参数的值为cfs_rq的权重（cfs_rq之中所有任务的权重和），如果更新的是可运行的任务任务则为1。
+
+### `propagate_entity_load_avg`函数
+
+```c
+/* Update task and its cfs_rq load average */
+static inline int propagate_entity_load_avg(struct sched_entity *se)
+{
+	struct cfs_rq *cfs_rq, *gcfs_rq;
+
+	if (entity_is_task(se))
+		return 0;
+
+	gcfs_rq = group_cfs_rq(se);
+	if (!gcfs_rq->propagate)
+		return 0;
+
+	gcfs_rq->propagate = 0;
+
+	cfs_rq = cfs_rq_of(se);
+
+	add_tg_cfs_propagate(cfs_rq, gcfs_rq->prop_runnable_sum);
+
+	update_tg_cfs_util(cfs_rq, se, gcfs_rq);
+	update_tg_cfs_runnable(cfs_rq, se, gcfs_rq);
+	update_tg_cfs_load(cfs_rq, se, gcfs_rq);
+
+	trace_pelt_cfs_tp(cfs_rq);
+	trace_pelt_se_tp(se);
+
+	return 1;
+}
+```
+
+这个函数在实体对应一个任务组时向调度层级之中的上级传递`util`、`runnable`、`load`指标的变化，在记录记录的更新函数之前需要先明确三个变量的含义：cfs_rq为任务组所在的cfs_rq，se为任务组自身、gcfs_rq之中保存了任务组之中的任务。
+
+首先使用`add_tg_cfs_propagate`函数将任务组之中任务的`runnable_sum`指标变动记录到任务组所在的cfs_rq之中，然后调用`update_tg_cfs_{util, runnable, load}`三个函数更新任务组、任务组所在cfs_rq中三个指标的值，具体更新流程在这三个函数之中说明。
+
+### `update_tg_cfs_util`函数
+
+```c
+static inline void
+update_tg_cfs_util(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+{
+	long delta_sum, delta_avg = gcfs_rq->avg.util_avg - se->avg.util_avg;
+	u32 new_sum, divider;
+
+	/* Nothing to update */
+	if (!delta_avg)
+		return;
+
+	/*
+	 * cfs_rq->avg.period_contrib can be used for both cfs_rq and se.
+	 * See ___update_load_avg() for details.
+	 */
+	divider = get_pelt_divider(&cfs_rq->avg);
+
+
+	/* Set new sched_entity's utilization */
+	se->avg.util_avg = gcfs_rq->avg.util_avg;
+	new_sum = se->avg.util_avg * divider;
+	delta_sum = (long)new_sum - (long)se->avg.util_sum;
+	se->avg.util_sum = new_sum;
+
+	/* Update parent cfs_rq utilization */
+	add_positive(&cfs_rq->avg.util_avg, delta_avg);
+	add_positive(&cfs_rq->avg.util_sum, delta_sum);
+
+	/* See update_cfs_rq_load_avg() */
+	cfs_rq->avg.util_sum = max_t(u32, cfs_rq->avg.util_sum,
+					  cfs_rq->avg.util_avg * PELT_MIN_DIVIDER);
+}
+```
+
+这个函数更新任务组以及任务组所在cfs_rq的`util`指标，三个参数的含义在`propagate_entity_load_avg`函数的流程之中已经说明。这个函数分为5步：1).计算任务组与任务组之中所有任务的`util_avg`的变化，2).将任务组的`util_avg`指标设置为任务组之中所有任务的`util_avg`指标，3).计算任务组的`util_sum`指标并且得到这个指标的变化，4).将变化更新到任务组所在的cfs_rq之中，5).保证任务组所在cfs_rq之中`util_sum`的最小值。`update_tg_cfs_runnable`函数更新任务组以及任务组所在cfs_rq的`runnable`相关指标，计算流程与这个函数完全一样，只不过是处理的指标不同，不在单独记录这个函数的流程。
+
+### `update_tg_cfs_load`函数
+
+```c
+static inline void
+update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+{
+	long delta_avg, running_sum, runnable_sum = gcfs_rq->prop_runnable_sum;
+	unsigned long load_avg;
+	u64 load_sum = 0;
+	s64 delta_sum;
+	u32 divider;
+
+	if (!runnable_sum)
+		return;
+
+	gcfs_rq->prop_runnable_sum = 0;
+
+	/*
+	 * cfs_rq->avg.period_contrib can be used for both cfs_rq and se.
+	 * See ___update_load_avg() for details.
+	 */
+	divider = get_pelt_divider(&cfs_rq->avg);
+
+	if (runnable_sum >= 0) {
+		/*
+		 * Add runnable; clip at LOAD_AVG_MAX. Reflects that until
+		 * the CPU is saturated running == runnable.
+		 */
+		runnable_sum += se->avg.load_sum;
+		runnable_sum = min_t(long, runnable_sum, divider);
+	} else {
+		/*
+		 * Estimate the new unweighted runnable_sum of the gcfs_rq by
+		 * assuming all tasks are equally runnable.
+		 */
+		if (scale_load_down(gcfs_rq->load.weight)) {
+			load_sum = div_u64(gcfs_rq->avg.load_sum,
+				scale_load_down(gcfs_rq->load.weight));
+		}
+
+		/* But make sure to not inflate se's runnable */
+		runnable_sum = min(se->avg.load_sum, load_sum);
+	}
+
+	/*
+	 * runnable_sum can't be lower than running_sum
+	 * Rescale running sum to be in the same range as runnable sum
+	 * running_sum is in [0 : LOAD_AVG_MAX <<  SCHED_CAPACITY_SHIFT]
+	 * runnable_sum is in [0 : LOAD_AVG_MAX]
+	 */
+	running_sum = se->avg.util_sum >> SCHED_CAPACITY_SHIFT;
+	runnable_sum = max(runnable_sum, running_sum);
+
+	load_sum = se_weight(se) * runnable_sum;
+	load_avg = div_u64(load_sum, divider);
+
+	delta_avg = load_avg - se->avg.load_avg;
+	if (!delta_avg)
+		return;
+
+	delta_sum = load_sum - (s64)se_weight(se) * se->avg.load_sum;
+
+	se->avg.load_sum = runnable_sum;
+	se->avg.load_avg = load_avg;
+	add_positive(&cfs_rq->avg.load_avg, delta_avg);
+	add_positive(&cfs_rq->avg.load_sum, delta_sum);
+	/* See update_cfs_rq_load_avg() */
+	cfs_rq->avg.load_sum = max_t(u32, cfs_rq->avg.load_sum,
+					  cfs_rq->avg.load_avg * PELT_MIN_DIVIDER);
+}
+```
+
+这个函数更新任务组以及任务组所在cfs_rq的`util`指标，三个参数的含义在`propagate_entity_load_avg`函数的流程之中已经说明。这个函数的计算流程都涉及到`runnable_sum`变量的值，这个变量的值为任务组之中`runnable_sum`指标的变动，这个指标意味着任务组中有任务离开、进入了cfs_rq之中。`runnable_sum`的值可能会有小于0的情况，在小于0的情况与大于0的情况中计算逻辑完全不同，记录两种情况的计算逻辑之前需要明确cfs_rq以及实体的`load_sum`计算之间的不同。
+
+注意到`__upate_load_avg_cfs_rq`以及`__update_load_avg_se`这两个函数调用`___update_load_sum`函数时`load`参数的值的含义是不同的，前者是cfs_rq之中任务的权重之和，后者是任务是否处于可运行状态，结合`___update_load_sum`函数的含义之中`load_sum`的计算可以发现，cfs_rq的`load_sum`为两次更新时间差的几何级数之和与权重之和的乘积，而实体（例如对应任务组的实体）的`load_sum`在实体处于可运行状态是为两次更新时间差的几何级数之和，这个差别导致了在`runnable_sum`小于0和大于0时不同的处理。
+
+当`runnable_sum`小于0时任务组中有任务离开了cfs_rq、变成了不可运行的状态了，这个时候计算任务组中每个可运行任务的平均`load_sum`并限制其最小值为任务组的`load_sum`，计算结果保存至`runnable_sum`之中，计算过程中出现除法计算的原因参见上一段的内容。当`runnable_sum`大于0时将`runnable_sum`更新为任务组目前`load_sum`与任务组之中`runnable_sum`指标变动的和并且限制其最大值，这种情况下代码逻辑很容易理解。无论`runnable_sum`更新前的值是大于0还是小于0，更新之后的值为任务组的`load_sum`的值。
+
+考虑到对于一个实体（实体可以对应一个任务组）来讲，可运行时间之中包含了在cfs_rq之中等待的时间、在cpu之中运行的时间，所以在接下来的代码之中比较任务组的`load_sum`以及`util_sum`之间的值，保证`load_sum`的值不小于`util_sum`的值。然后计算任务组的`load_avg`的值（`load_sum`与任务组的权重之积除以几何级数之和的最大值，这种计算方式与`___update_load_avg`中`load_avg`的计算方式相同）、更新任务组的`load_sum`的值（仅仅是一个简单的赋值操作），最后更新任务组所在的cfs_rq的指标。
+
+更新任务组所在cfs_rq的指标时，先计算任务组的`load_sum`、`load_avg`指标的变化，然后将变化更新到cfs_rq的对应指标之中去，从这里可以看到cfs_rq中指标的值为其中实体的对应指标之和。
