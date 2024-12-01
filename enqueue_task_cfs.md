@@ -442,3 +442,74 @@ static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
 ```
 
 这个函数计算等式7之中除去$d_1 * y^p$ 之后剩余部分的和，这个函数之中`c2`的计算对应等式6，`c1`的计算对应等式7中$u_{p+1} * y^n$，涉及到幂计算的时候直接调用`delay_load`函数进行，这个函数的思路在`accumulate_sum`函数中有记录。这个函数的参数之中`periods`为`delta`分布在多少个周期之中，`d1`、`d3`分别对应`___update_load_sum`函数记录中的$u_{p+1}$、$u_0$。
+
+### `___update_load_avg`函数
+
+```c
+/*
+ * When syncing *_avg with *_sum, we must take into account the current
+ * position in the PELT segment otherwise the remaining part of the segment
+ * will be considered as idle time whereas it's not yet elapsed and this will
+ * generate unwanted oscillation in the range [1002..1024[.
+ *
+ * The max value of *_sum varies with the position in the time segment and is
+ * equals to :
+ *
+ *   LOAD_AVG_MAX*y + sa->period_contrib
+ *
+ * which can be simplified into:
+ *
+ *   LOAD_AVG_MAX - 1024 + sa->period_contrib
+ *
+ * because LOAD_AVG_MAX*y == LOAD_AVG_MAX-1024
+ *
+ * The same care must be taken when a sched entity is added, updated or
+ * removed from a cfs_rq and we need to update sched_avg. Scheduler entities
+ * and the cfs rq, to which they are attached, have the same position in the
+ * time segment because they use the same clock. This means that we can use
+ * the period_contrib of cfs_rq when updating the sched_avg of a sched_entity
+ * if it's more convenient.
+ */
+static __always_inline void
+___update_load_avg(struct sched_avg *sa, unsigned long load)
+{
+	u32 divider = get_pelt_divider(sa);
+
+	/*
+	 * Step 2: update *_avg.
+	 */
+	sa->load_avg = div_u64(load * sa->load_sum, divider);
+	sa->runnable_avg = div_u64(sa->runnable_sum, divider);
+	WRITE_ONCE(sa->util_avg, sa->util_sum / divider);
+}
+```
+
+计算出来三个`sum`指标之后，这个函数计算这三个指标对应的`avg`指标，三个`avg`指标涉及到三个`sum`指标除以`get_pelt_divider`函数返回的值，这个函数返回了几何级数和的极限值与`___update_load_sum`函数流程记录中提到的$u_0$的和，这个值可以理解为最大值。这里几何级数之和的极限可以理解为几何级数之和的最大值，结合注释可以理解为将这个最大值和$u_0$求和为了防止将$u_0$这段时间当做空闲时间而带来不必要的振荡，至于为什么这么做会产生振荡可能是作者在做实验的过程中发现的。
+
+`load_avg`指标是实体权重与`load_sum`之积然后除以最大值的结果，`runnable_avg`以及`util_avg`为对应的`sum`指标除以最大值的结果。三个`avg`指标计算很简单，但是为什么除以最大值更值得关注，查阅资料之后认为通过除以最大值可以将计算结果标准化、实现旧的值随着时间推移的衰减、防止累计值无限扩大。
+
+### `get_pelt_divider`函数
+
+```c
+#define PELT_MIN_DIVIDER	(LOAD_AVG_MAX - 1024)
+
+static inline u32 get_pelt_divider(struct sched_avg *avg)
+{
+	return PELT_MIN_DIVIDER + avg->period_contrib;
+}
+```
+
+这个函数用于返回一个最大值，计算方法为：
+$$
+\sum_{n=1}^{∞}y^n * y * 1024 + u_0
+$$
+其中：
+$$
+\sum_{n=1}^{∞} y^n = \frac{1}{1-y}
+$$
+
+$$
+等式8： \sum_{n=1}^{∞} y^n * y * 1024 = \frac{1}{1-y} * y * 1024 = \frac{1}{1-y} * 1024 - 1024
+$$
+
+`PELT_MIN_DIVIDER`代表的值对应等式8的结果，`avg->period_contrib`对应$u_0$。
