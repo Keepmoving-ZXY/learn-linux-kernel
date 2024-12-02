@@ -698,6 +698,73 @@ update_tg_cfs_util(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq
 ### `update_tg_cfs_load`函数
 
 ```c
+/*
+ * When on migration a sched_entity joins/leaves the PELT hierarchy, we need to
+ * propagate its contribution. The key to this propagation is the invariant
+ * that for each group:
+ *
+ *   ge->avg == grq->avg						(1)
+ *
+ * _IFF_ we look at the pure running and runnable sums. Because they
+ * represent the very same entity, just at different points in the hierarchy.
+ *
+ * Per the above update_tg_cfs_util() and update_tg_cfs_runnable() are trivial
+ * and simply copies the running/runnable sum over (but still wrong, because
+ * the group entity and group rq do not have their PELT windows aligned).
+ *
+ * However, update_tg_cfs_load() is more complex. So we have:
+ *
+ *   ge->avg.load_avg = ge->load.weight * ge->avg.runnable_avg		(2)
+ *
+ * And since, like util, the runnable part should be directly transferable,
+ * the following would _appear_ to be the straight forward approach:
+ *
+ *   grq->avg.load_avg = grq->load.weight * grq->avg.runnable_avg	(3)
+ *
+ * And per (1) we have:
+ *
+ *   ge->avg.runnable_avg == grq->avg.runnable_avg
+ *
+ * Which gives:
+ *
+ *                      ge->load.weight * grq->avg.load_avg
+ *   ge->avg.load_avg = -----------------------------------		(4)
+ *                               grq->load.weight
+ *
+ * Except that is wrong!
+ *
+ * Because while for entities historical weight is not important and we
+ * really only care about our future and therefore can consider a pure
+ * runnable sum, runqueues can NOT do this.
+ *
+ * We specifically want runqueues to have a load_avg that includes
+ * historical weights. Those represent the blocked load, the load we expect
+ * to (shortly) return to us. This only works by keeping the weights as
+ * integral part of the sum. We therefore cannot decompose as per (3).
+ *
+ * Another reason this doesn't work is that runnable isn't a 0-sum entity.
+ * Imagine a rq with 2 tasks that each are runnable 2/3 of the time. Then the
+ * rq itself is runnable anywhere between 2/3 and 1 depending on how the
+ * runnable section of these tasks overlap (or not). If they were to perfectly
+ * align the rq as a whole would be runnable 2/3 of the time. If however we
+ * always have at least 1 runnable task, the rq as a whole is always runnable.
+ *
+ * So we'll have to approximate.. :/
+ *
+ * Given the constraint:
+ *
+ *   ge->avg.running_sum <= ge->avg.runnable_sum <= LOAD_AVG_MAX
+ *
+ * We can construct a rule that adds runnable to a rq by assuming minimal
+ * overlap.
+ *
+ * On removal, we'll assume each task is equally runnable; which yields:
+ *
+ *   grq->avg.runnable_sum = grq->avg.load_sum / grq->load.weight
+ *
+ * XXX: only do this for the part of runnable > running ?
+ *
+ */
 static inline void
 update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
 {
@@ -767,11 +834,13 @@ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq
 }
 ```
 
+在``6.1.116`版本的内核中，这个函数前的注释其实是在`update_tg_cfs_util`函数之前，在阅读这些代码的时候发现这些注释有助于理解`update_tg_cfs_load`函数，于是就把注释的内容放到这个函数之前，在记录函数的流程之前先简单记录一下这些注释中的内容。当有实体离开或者进入任务组的cfs_rq之中时，会导致cfs_rq的三个指标发生变化，这个时候需要向调度层级的上级传递这些变化，传递过程中最重要的是维持任务组之中cfs_rq的`avg`相关指标与任务组的`avg`相关指标相同，作者提到这个仅适用于`util`、`runnable`指标但不适用于`load`指标。注释中给出了不合适`load_avg`指标计算的理由，即如果对于`load`指标也保持这个相等关系则意味着`ge->avg.load_avg == grp->avg.load_avg`，结合注释中等式2、3可以通过简单的除法计算得到`ge->avg.load_avg`的值，这种计算方式忽略了两个关键点：1.对于实体在进行`load_avg`计算过程中更关注未来会占用多少时间而不关注权重，但对于cfs_rq来讲更关注权重并且还会把权重当作计算`load_avg`的一部分，关注点不同无法简单的数值相等关系表达，2.cfs_rq的`runnable`指标计算比较复杂，无法简单用一个相同关系来表示二者之间的关系（例如若一个cfs_rq之中有两个任务并且这两个任务时间在其时间的$\frac{2}{3}$处于`runnable`状态，那么无论两个任务处于`runnable`状态的时间如何重叠，cfs_rq在时间的($\frac{2}{3}, 1$)这部分的某个位置处于`runnable`状态）。针对不适用`load_avg`指标的问题，作者假设cfs_rq中任务的`runnable`时间尽量不重叠，在有任务离开cfs_rq之后假设所有cfs_rq之中所有的任务处于`runnable`状态的时间都相同，这样得到了注释之中最后一个等式，这个等式会在代码之中有所体现。
+
 这个函数更新任务组以及任务组所在cfs_rq的`util`指标，三个参数的含义在`propagate_entity_load_avg`函数的流程之中已经说明。这个函数的计算流程都涉及到`runnable_sum`变量的值，这个变量的值为任务组之中`runnable_sum`指标的变动，这个指标意味着任务组中有任务离开、进入了cfs_rq之中。`runnable_sum`的值可能会有小于0的情况，在小于0的情况与大于0的情况中计算逻辑完全不同，记录两种情况的计算逻辑之前需要明确cfs_rq以及实体的`load_sum`计算之间的不同。
 
 注意到`__upate_load_avg_cfs_rq`以及`__update_load_avg_se`这两个函数调用`___update_load_sum`函数时`load`参数的值的含义是不同的，前者是cfs_rq之中任务的权重之和，后者是任务是否处于可运行状态，结合`___update_load_sum`函数的含义之中`load_sum`的计算可以发现，cfs_rq的`load_sum`为两次更新时间差的几何级数之和与权重之和的乘积，而实体（例如对应任务组的实体）的`load_sum`在实体处于可运行状态是为两次更新时间差的几何级数之和，这个差别导致了在`runnable_sum`小于0和大于0时不同的处理。
 
-当`runnable_sum`小于0时任务组中有任务离开了cfs_rq、变成了不可运行的状态了，这个时候计算任务组中每个可运行任务的平均`load_sum`并限制其最小值为任务组的`load_sum`，计算结果保存至`runnable_sum`之中，计算过程中出现除法计算的原因参见上一段的内容。当`runnable_sum`大于0时将`runnable_sum`更新为任务组目前`load_sum`与任务组之中`runnable_sum`指标变动的和并且限制其最大值，这种情况下代码逻辑很容易理解。无论`runnable_sum`更新前的值是大于0还是小于0，更新之后的值为任务组的`load_sum`的值。
+当`runnable_sum`小于0时任务组中有任务离开了cfs_rq、变成了不可运行的状态了，这个时候计算任务组中每个可运行任务的平均`load_sum`并限制其最小值为任务组的`load_sum`，计算结果保存至`runnable_sum`之中，计算过程中出现除法计算的原因参见第一段和第三段的内容。当`runnable_sum`大于0时将`runnable_sum`更新为任务组目前`load_sum`与任务组之中`runnable_sum`指标变动的和并且限制其最大值，这种情况下代码逻辑很容易理解。无论`runnable_sum`更新前的值是大于0还是小于0，更新之后的值为任务组的`load_sum`的值。
 
 考虑到对于一个实体（实体可以对应一个任务组）来讲，可运行时间之中包含了在cfs_rq之中等待的时间、在cpu之中运行的时间，所以在接下来的代码之中比较任务组的`load_sum`以及`util_sum`之间的值，保证`load_sum`的值不小于`util_sum`的值。然后计算任务组的`load_avg`的值（`load_sum`与任务组的权重之积除以几何级数之和的最大值，这种计算方式与`___update_load_avg`中`load_avg`的计算方式相同）、更新任务组的`load_sum`的值（仅仅是一个简单的赋值操作），最后更新任务组所在的cfs_rq的指标。
 
