@@ -598,7 +598,19 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
 
 这个函数用于更新cfs_rq上的`runnable_avg`、`util_avg`、`load_avg`三个指标的值。这个函数首先处理当cfs_rq之中有实体离开的情况（`cfs_rq->removed.nr`不为0），分别更新`runnable`、`util`、`load`这三个指标的`avg`以及`sum`的值，更新`avg`时直接减去因任务离开cfs_rq而减少的值均值，更新`sum`时则要减去减少的均值与指标最大值的乘积。这里需要注意的是在`sum`指标更新之后需要保证`sum`指标的最小值，如代码中的注释所说，这是因为在两次更新这些`sum`指标的时候可能会有大量的任务从cfs_rq之中移除，这就会导致cfs_rq的`avg`指标不为0但是`sum`指标为0的情况，此时需要根据`avg`指标的值来修正`sum`指标的值。当这一层之中有实体移除时，不仅仅是这一层的指标会发生变化，上层的指标也会发生变化，`add_tg_cfs_propagate`函数将被移除实体的`runnable_avg`暂存起来，在后续的流程中更高的调度层级之中传递这个变化。
 
-更新cfs_rq的`avg`指标的流程在`__update_load_avg_cfs_rq`函数之中，接下来记录这个函数的流程。
+更新cfs_rq的`avg`指标的流程在`__update_load_avg_cfs_rq`函数之中，在后边记录这个函数的流程。
+
+### `add_tg_cfs_propagate`函数
+
+```c
+static inline void add_tg_cfs_propagate(struct cfs_rq *cfs_rq, long runnable_sum)
+{
+	cfs_rq->propagate = 1;
+	cfs_rq->prop_runnable_sum += runnable_sum;
+}
+```
+
+这个函数之中将需要向调度层级之中的上级传播的`runnable_sum`指标缓存到cfs_rq的`prop_runnable_sum`，在`update_tg_cfs_load`函数之中会使用这个字段向上级传播`runnable_sum`的变化，详见这个函数的流程记录。
 
 ### `__upate_load_avg_cfs_rq`函数
 
@@ -655,7 +667,7 @@ static inline int propagate_entity_load_avg(struct sched_entity *se)
 
 这个函数在实体对应一个任务组时向调度层级之中的上级传递`util`、`runnable`、`load`指标的变化，在记录记录的更新函数之前需要先明确三个变量的含义：cfs_rq为任务组所在的cfs_rq，se为任务组自身、gcfs_rq之中保存了任务组之中的任务。
 
-首先使用`add_tg_cfs_propagate`函数将任务组之中任务的`runnable_sum`指标变动记录到任务组所在的cfs_rq之中，然后调用`update_tg_cfs_{util, runnable, load}`三个函数更新任务组、任务组所在cfs_rq中三个指标的值，具体更新流程在这三个函数之中说明。
+首先使用`add_tg_cfs_propagate`函数将任务组之中任务的`runnable_sum`指标变动暂存到任务组所在的cfs_rq之中，然后调用`update_tg_cfs_{util, runnable, load}`三个函数更新任务组、任务组所在cfs_rq中三个指标的值，具体更新流程在这三个函数之中说明。
 
 ### `update_tg_cfs_util`函数
 
@@ -845,3 +857,168 @@ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq
 考虑到对于一个实体（实体可以对应一个任务组）来讲，可运行时间之中包含了在cfs_rq之中等待的时间、在cpu之中运行的时间，所以在接下来的代码之中比较任务组的`load_sum`以及`util_sum`之间的值，保证`load_sum`的值不小于`util_sum`的值。然后计算任务组的`load_avg`的值（`load_sum`与任务组的权重之积除以几何级数之和的最大值，这种计算方式与`___update_load_avg`中`load_avg`的计算方式相同）、更新任务组的`load_sum`的值（仅仅是一个简单的赋值操作），最后更新任务组所在的cfs_rq的指标。
 
 更新任务组所在cfs_rq的指标时，先计算任务组的`load_sum`、`load_avg`指标的变化，然后将变化更新到cfs_rq的对应指标之中去，从这里可以看到cfs_rq中指标的值为其中实体的对应指标之和。
+
+### `attach_entity_load_avg`函数
+
+```c
+/**
+ * attach_entity_load_avg - attach this entity to its cfs_rq load avg
+ * @cfs_rq: cfs_rq to attach to
+ * @se: sched_entity to attach
+ *
+ * Must call update_cfs_rq_load_avg() before this, since we rely on
+ * cfs_rq->avg.last_update_time being current.
+ */
+static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	/*
+	 * cfs_rq->avg.period_contrib can be used for both cfs_rq and se.
+	 * See ___update_load_avg() for details.
+	 */
+	u32 divider = get_pelt_divider(&cfs_rq->avg);
+
+	/*
+	 * When we attach the @se to the @cfs_rq, we must align the decay
+	 * window because without that, really weird and wonderful things can
+	 * happen.
+	 *
+	 * XXX illustrate
+	 */
+	se->avg.last_update_time = cfs_rq->avg.last_update_time;
+	se->avg.period_contrib = cfs_rq->avg.period_contrib;
+
+	/*
+	 * Hell(o) Nasty stuff.. we need to recompute _sum based on the new
+	 * period_contrib. This isn't strictly correct, but since we're
+	 * entirely outside of the PELT hierarchy, nobody cares if we truncate
+	 * _sum a little.
+	 */
+	se->avg.util_sum = se->avg.util_avg * divider;
+
+	se->avg.runnable_sum = se->avg.runnable_avg * divider;
+
+	se->avg.load_sum = se->avg.load_avg * divider;
+	if (se_weight(se) < se->avg.load_sum)
+		se->avg.load_sum = div_u64(se->avg.load_sum, se_weight(se));
+	else
+		se->avg.load_sum = 1;
+
+	enqueue_load_avg(cfs_rq, se);
+	cfs_rq->avg.util_avg += se->avg.util_avg;
+	cfs_rq->avg.util_sum += se->avg.util_sum;
+	cfs_rq->avg.runnable_avg += se->avg.runnable_avg;
+	cfs_rq->avg.runnable_sum += se->avg.runnable_sum;
+
+	add_tg_cfs_propagate(cfs_rq, se->avg.load_sum);
+
+	cfs_rq_util_change(cfs_rq, 0);
+
+	trace_pelt_cfs_tp(cfs_rq);
+}
+```
+
+将实体放入到cfs_rq时要更新更新实体以及cfs_rq的`load`、`util`、`runnable`三个指标，这个函数就是在进行这些指标的更新，从这个函数之中可以看到cfs_rq指标的值与单个指标值的对应关系。这个函数首先将cfs_rq和实体的衰减窗口对其，这里的衰减窗口涉及到`last_update_time`以及`period_contrib`两个字段，这两个字段在计算几何级数之和的时候很重要，详见本文档中`accumulate_sum`函数流程记录。
+
+接下来重新计算实体的`sum`相关指标，`util_sum`以及`runnable_sum`直接使用实体对应的`avg`指标乘以这个cfs_rq的`divider`（`divider`的含义以及使用它背后的原因见`___update_load_avg`、`get_pelt_divider`函数），`load_sum`的计算过程是由`load_sum`计算`load_avg`的反过程（由`load_sum`计算`load_avg`的过程见`___update_load_avg`函数），计算过程中涉到实体权重与中间计算结果（`se->avg.load_sum = se->avg.load_avg * divider`）的除法，这里要考虑二者之间的大小关系，若实体权重小于中间计算结果直接默认二者是相同的。
+
+接下来更新cfs_rq的三个指标，其中cfs_rq的`util`、`runnable`指标的`sum`、`avg`直接加上实体对应的值即可，`load`指标的更新在`enqueue_load_avg`函数之中进行，在后边会详细记录这个函数的流程。完成了cfs_rq的三个指标更新之后，调用`cfs_rq_util_change`更新cpu调频所需数据。
+
+### `enqueue_load_avg`函数
+
+```c
+enqueue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	cfs_rq->avg.load_avg += se->avg.load_avg;
+	cfs_rq->avg.load_sum += se_weight(se) * se->avg.load_sum;
+}
+```
+
+从这个函数之中可以看到实体的`load`指标与其所在cfs_rq中`load`指标的关系：cfs_rq的`load_avg`为cfs_rq之中所有实体的`load_avg`之和，cfs_rq的`load_sum`指标为cfs_rq中所有实体的`load_sum`与其权重之积的和。
+
+### `update_tg_load_avg`函数
+
+```c
+/**
+ * update_tg_load_avg - update the tg's load avg
+ * @cfs_rq: the cfs_rq whose avg changed
+ *
+ * This function 'ensures': tg->load_avg := \Sum tg->cfs_rq[]->avg.load.
+ * However, because tg->load_avg is a global value there are performance
+ * considerations.
+ *
+ * In order to avoid having to look at the other cfs_rq's, we use a
+ * differential update where we store the last value we propagated. This in
+ * turn allows skipping updates if the differential is 'small'.
+ *
+ * Updating tg's load_avg is necessary before update_cfs_share().
+ */
+static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+{
+	long delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
+
+	/*
+	 * No need to update load_avg for root_task_group as it is not used.
+	 */
+	if (cfs_rq->tg == &root_task_group)
+		return;
+
+	if (abs(delta) > cfs_rq->tg_load_avg_contrib / 64) {
+		atomic_long_add(delta, &cfs_rq->tg->load_avg);
+		cfs_rq->tg_load_avg_contrib = cfs_rq->avg.load_avg;
+	}
+}
+```
+
+这个函数更新任务组的`load_avg`，在记录函数流程之前先说明任务组与cfs_rq、实体的关系。在`struct task_group`之中包含`se`、`cfs_rq`两个指针，这两个指针之中的内容为任务组在每个cpu之中的实体、任务组在每个cpu上的cfs_rq，任务组在每个cpu上的实体用于任务组参与每个cpu上的任务调度过程，任务组在每个cpu上的cfs_rq用于保存任务组的任务中在每个cpu上可运行的任务。这个函数的`cfs_rq`参数为任务组在某个cpu上的cfs_rq，这个函数仅仅是将cfs_rq的`load_avg`加到任务组的`load_avg`之中，只不过是在保证正确性的情况下使cfs_rq之中`load_avg`变动积累到比较大的时候再向任务组更新，即只有在本次、上次更新期间cfs_rq的`load_avg`差距超过上次更新时`load_avg`的$\frac{1}{64}$时才向任务组更新一次，这样减小了更新频率，可以参见这个函数之中的注释帮助理解。
+
+### `detach_entity_load_avg`函数
+
+```c
+/**
+ * detach_entity_load_avg - detach this entity from its cfs_rq load avg
+ * @cfs_rq: cfs_rq to detach from
+ * @se: sched_entity to detach
+ *
+ * Must call update_cfs_rq_load_avg() before this, since we rely on
+ * cfs_rq->avg.last_update_time being current.
+ */
+static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	dequeue_load_avg(cfs_rq, se);
+	sub_positive(&cfs_rq->avg.util_avg, se->avg.util_avg);
+	sub_positive(&cfs_rq->avg.util_sum, se->avg.util_sum);
+	/* See update_cfs_rq_load_avg() */
+	cfs_rq->avg.util_sum = max_t(u32, cfs_rq->avg.util_sum,
+					  cfs_rq->avg.util_avg * PELT_MIN_DIVIDER);
+
+	sub_positive(&cfs_rq->avg.runnable_avg, se->avg.runnable_avg);
+	sub_positive(&cfs_rq->avg.runnable_sum, se->avg.runnable_sum);
+	/* See update_cfs_rq_load_avg() */
+	cfs_rq->avg.runnable_sum = max_t(u32, cfs_rq->avg.runnable_sum,
+					      cfs_rq->avg.runnable_avg * PELT_MIN_DIVIDER);
+
+	add_tg_cfs_propagate(cfs_rq, -se->avg.load_sum);
+
+	cfs_rq_util_change(cfs_rq, 0);
+
+	trace_pelt_cfs_tp(cfs_rq);
+}
+```
+
+当一个实体要离开cfs_rq时需要从cfs_rq的指标之中减去这个实体贡献的部分，这个函数就是在执行这样的操作。首先调用`dequeue_load_avg`函数从cfs_rq的`load_sum`、`load_avg`减去实体的贡献，后边详细记录此函数的内容；然后从cfs_rq的`util`、`runnable`指标之中减去实体的贡献，`util_sum`以及`avg_sum`要保证最小值，这背后的原因在`update_cfs_rq_load_avg`函数之中有说明；最后从cfs_rq需要向调度层级中的上级传递的`load_sum`指标值之中减去这个实体的`load_sum`指标的值、调用`cfs_rq_util_change`更新cpu调频所需数据。
+
+### `dequeue_load_avg`函数
+
+```c
+static inline void
+dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	sub_positive(&cfs_rq->avg.load_avg, se->avg.load_avg);
+	sub_positive(&cfs_rq->avg.load_sum, se_weight(se) * se->avg.load_sum);
+	/* See update_cfs_rq_load_avg() */
+	cfs_rq->avg.load_sum = max_t(u32, cfs_rq->avg.load_sum,
+					  cfs_rq->avg.load_avg * PELT_MIN_DIVIDER);
+}
+```
+
+这个函数的计算与`enqueue_load_avg`函数相反，从cfs_rq的`load_sum`、`load_avg`之中减去实体对应的指标，最后保证cfs_rq的`load_sum`指标的最小值。
