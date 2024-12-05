@@ -1022,3 +1022,42 @@ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
 ```
 
 这个函数的计算与`enqueue_load_avg`函数相反，从cfs_rq的`load_sum`、`load_avg`之中减去实体对应的指标，最后保证cfs_rq的`load_sum`指标的最小值。
+
+### `se_update_runnable`函数
+
+```c
+static inline void se_update_runnable(struct sched_entity *se)
+{
+	if (!entity_is_task(se))
+		se->runnable_weight = se->my_q->h_nr_running;
+}
+```
+
+当实体对应一个任务组时，即实体为任务组在某个cpu上的调度实体，将实体的`runnable_weight`设置为任务组在同样cpu上cfs_rq中可运行任务的数量统计。这里的`se`与`se->my_q`为任务组在同一个cpu上的调度实体以及cfs_rq，任务组在cpu上的调度实体以及cfs_rq及其含义见`update_tg_load_avg`函数之中对`struct task_group`之中`se`、`cfs_rq`两个指针的含义的解释。
+
+### `update_cfs_group`函数
+
+
+
+### `account_entity_enqueue`函数
+
+```c
+static void
+account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	update_load_add(&cfs_rq->load, se->load.weight);
+#ifdef CONFIG_SMP
+	if (entity_is_task(se)) {
+		struct rq *rq = rq_of(cfs_rq);
+
+		account_numa_enqueue(rq, task_of(se));
+		list_add(&se->group_node, &rq->cfs_tasks);
+	}
+#endif
+	cfs_rq->nr_running++;
+	if (se_is_idle(se))
+		cfs_rq->idle_nr_running++;
+}
+```
+
+这个函数执行调度实体进入cfs_rq时cfs_rq之中的统计字段更新，首先使用`update_load_weight`函数将实体的权重加入到cfs_rq的权重之中，随后递增cfs_rq之中可运行的任务统计，最后若任务为一个空闲任务更新cfs_rq之中可运行的空闲任务统计。上述更新过程中若发现实体对应一个任务，则将其加入到rq的`cfs_tasks`队列之中，这个队列管理rq之中有`CFS`调度类管理的任务。
