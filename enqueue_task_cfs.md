@@ -1037,7 +1037,145 @@ static inline void se_update_runnable(struct sched_entity *se)
 
 ### `update_cfs_group`函数
 
+```c
+static void update_cfs_group(struct sched_entity *se)
+{
+	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
+	long shares;
 
+	if (!gcfs_rq)
+		return;
+
+	if (throttled_hierarchy(gcfs_rq))
+		return;
+
+#ifndef CONFIG_SMP
+	shares = READ_ONCE(gcfs_rq->tg->shares);
+
+	if (likely(se->load.weight == shares))
+		return;
+#else
+	shares   = calc_group_shares(gcfs_rq);
+#endif
+
+	reweight_entity(cfs_rq_of(se), se, shares);
+}
+```
+
+这个函数用于更新任务组在某个cpu上实体的权重，在记录函数流程的时候仅考虑定义了`CONFIG_SMP`宏情况下执行的代码。这个函数在确保实体对应一个任务组时，即实体为任务组在某个cpu上的调度实体时，才会继续执行真正的计算逻辑。真正的计算逻辑封装在了两个函数之中：`calc_group_shares`函数重新计算实体的权重、`reweight_entity`更新实体权重，这两步操作关联到了许多内容因此将具体的操作放到了两个函数之中，接下来详细记录这两个函数的内容。
+
+### `calc_group_shares`函数
+
+```c
+/*
+ * All this does is approximate the hierarchical proportion which includes that
+ * global sum we all love to hate.
+ *
+ * That is, the weight of a group entity, is the proportional share of the
+ * group weight based on the group runqueue weights. That is:
+ *
+ *                     tg->weight * grq->load.weight
+ *   ge->load.weight = -----------------------------               (1)
+ *                       \Sum grq->load.weight
+ *
+ * Now, because computing that sum is prohibitively expensive to compute (been
+ * there, done that) we approximate it with this average stuff. The average
+ * moves slower and therefore the approximation is cheaper and more stable.
+ *
+ * So instead of the above, we substitute:
+ *
+ *   grq->load.weight -> grq->avg.load_avg                         (2)
+ *
+ * which yields the following:
+ *
+ *                     tg->weight * grq->avg.load_avg
+ *   ge->load.weight = ------------------------------              (3)
+ *                             tg->load_avg
+ *
+ * Where: tg->load_avg ~= \Sum grq->avg.load_avg
+ *
+ * That is shares_avg, and it is right (given the approximation (2)).
+ *
+ * The problem with it is that because the average is slow -- it was designed
+ * to be exactly that of course -- this leads to transients in boundary
+ * conditions. In specific, the case where the group was idle and we start the
+ * one task. It takes time for our CPU's grq->avg.load_avg to build up,
+ * yielding bad latency etc..
+ *
+ * Now, in that special case (1) reduces to:
+ *
+ *                     tg->weight * grq->load.weight
+ *   ge->load.weight = ----------------------------- = tg->weight   (4)
+ *                         grp->load.weight
+ *
+ * That is, the sum collapses because all other CPUs are idle; the UP scenario.
+ *
+ * So what we do is modify our approximation (3) to approach (4) in the (near)
+ * UP case, like:
+ *
+ *   ge->load.weight =
+ *
+ *              tg->weight * grq->load.weight
+ *     ---------------------------------------------------         (5)
+ *     tg->load_avg - grq->avg.load_avg + grq->load.weight
+ *
+ * But because grq->load.weight can drop to 0, resulting in a divide by zero,
+ * we need to use grq->avg.load_avg as its lower bound, which then gives:
+ *
+ *
+ *                     tg->weight * grq->load.weight
+ *   ge->load.weight = -----------------------------		   (6)
+ *                             tg_load_avg'
+ *
+ * Where:
+ *
+ *   tg_load_avg' = tg->load_avg - grq->avg.load_avg +
+ *                  max(grq->load.weight, grq->avg.load_avg)
+ *
+ * And that is shares_weight and is icky. In the (near) UP case it approaches
+ * (4) while in the normal case it approaches (3). It consistently
+ * overestimates the ge->load.weight and therefore:
+ *
+ *   \Sum ge->load.weight >= tg->weight
+ *
+ * hence icky!
+ */
+static long calc_group_shares(struct cfs_rq *cfs_rq)
+{
+	long tg_weight, tg_shares, load, shares;
+	struct task_group *tg = cfs_rq->tg;
+
+	tg_shares = READ_ONCE(tg->shares);
+
+	load = max(scale_load_down(cfs_rq->load.weight), cfs_rq->avg.load_avg);
+
+	tg_weight = atomic_long_read(&tg->load_avg);
+
+	/* Ensure tg_weight >= load */
+	tg_weight -= cfs_rq->tg_load_avg_contrib;
+	tg_weight += load;
+
+	shares = (tg_shares * load);
+	if (tg_weight)
+		shares /= tg_weight;
+
+	/*
+	 * MIN_SHARES has to be unscaled here to support per-CPU partitioning
+	 * of a group with small tg->shares value. It is a floor value which is
+	 * assigned as a minimum load.weight to the sched_entity representing
+	 * the group on a CPU.
+	 *
+	 * E.g. on 64-bit for a group with tg->shares of scale_load(15)=15*1024
+	 * on an 8-core system with 8 tasks each runnable on one CPU shares has
+	 * to be 15*1024*1/8=1920 instead of scale_load(MIN_SHARES)=2*1024. In
+	 * case no task is runnable on a CPU MIN_SHARES=2 should be returned
+	 * instead of 0.
+	 */
+	return clamp_t(long, shares, MIN_SHARES, tg_shares);
+}
+```
+
+在记录这个函数的执行逻辑之前先记录注释中的内容，这些内容有助于理解代码中的计算逻辑，注释中`grq->load.weight`、`grp->avg.load_avg`之中`grp`指的是任务组在某个cpu上的cfs_rq。任务组在某个cpu上的实体的权重计算公式为注释中如等式(1)所示，但是等式(1)之中存在计算比较慢求和计算，使用`load_avg`替换等式(1)之中的实体权重`weight`得到等式(3)。使用了`load_avg`提到`weight`带来的弊端是`load_avg`的变化是比较缓慢的，这在一些边界情况中会引来误差。注释中还提到了一种特殊情况，在任务组之中只有一个任务的情况下只有一个cpu需要执行任务而其他的cpu都是空闲状态，此时可以对等式(1)进行化简得到等式(4)，此时结果永远是任务组权重这一个恒定的值，这种情况类似于在单核cpu之中运行。值得注意的是等式(4)为等式(1)在特殊情况下推到而言，但想要使用等式(3)替代等式(1)，这就意味着需要使用等式(3)来近似等式(4)的结果，于是有了在等式(3)中除数之中使用任务组在某个cpu上cfs_rq的权重替代其`load_avg`的想法，形成了等式(5)。在某些情况下等式(5)中会出现除数为0的情况，例如任务组之中只有一个任务等，使用等式(6)来替代等式(5)修复这个问题，等式(6)就是代码中实现的计算逻辑。
 
 ### `account_entity_enqueue`函数
 
