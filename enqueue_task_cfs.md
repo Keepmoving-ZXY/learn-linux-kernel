@@ -150,7 +150,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 这个函数将调度实体`se`放入到cfs_rq之中，在放入到cfs_rq前后需要更新许多任务相关的统计内容。`update_curr`函数的流程已经在`task_fork_cfs.md`中有记录，这个函数主要是更新正在运行任务的时间统计，在这个函数前后有两个`if`判断，这两个`if`判断成立时执行的操作都是将实体`se`的相对虚拟运行时间调整成虚拟运行时间，但是一个在`update_curr`函数之前、另外一个在这个函数之后，这背后的原因是：当第一个`if`判断成立时`se`对应的任务为cfs_rq之中正在运行的任务，更新这个任务的虚拟运行时间可能会影响`update_curr`函数中cfs_rq中虚拟运行时间基准的计算（`min_vruntime`），所以需要先更新任务的虚拟运行时间然后调用`update_curr`；如果`se`对应的任务不是cfs_rq中正在运行的任务，这个任务目前为止还没有加入到cfs_rq中，但是需要cfs_rq之中的虚拟运行时间基准来计算虚拟运行时间，所以需要在`update_curr`更新cfs_rq的虚拟运行时间基准之后执行。两个`if`判断之中还会涉及到`renorm`是否为`True`，它为`True`意味着`se`对应的任务不是被唤醒的任务或者从其他的rq中迁移过来的任务。
 
-从`update_load_avg`函数到`account_entity_queueue`函数更新任务以及cfs_rq的平均负载、更新任务组对的`runnable_weight`、重新计算任务组的权重、更新cfs_rq中运行任务的权重之和等操作，这些更新都封装到了不同的函数之中国，后边会对这些函数的流程进行记录。接下来使用`__enqueue_entity`函数将实体加入到cfs_rq之中，添加任务在rq中的标记(`on_rq`更新为1)，最后将cfs_rq放入到leaf_cfs_rq_list之中，在`list_add_leaf_cfs_rq`函数中解释这个list的作用。
+从`update_load_avg`函数到`account_entity_queueue`函数更新任务以及cfs_rq的平均负载、更新任务组对的`runnable_weight`、重新计算任务组的权重、更新cfs_rq中运行任务的权重之和等操作，这些更新都封装到了不同的函数之中，后边会对这些函数的流程进行记录。如果任务刚刚被唤醒，那么调用`place_entity`函数更新任务的虚拟运行时间，这个函数的流程在`task_fork_cfs.md`之中有记录；如果任务从其他的cpu之中迁移过来则重置`exec_start`字段的值。接下来使用`__enqueue_entity`函数将实体加入到cfs_rq之中，添加任务在rq中的标记(`on_rq`更新为1)，最后将cfs_rq放入到leaf_cfs_rq_list之中，在`list_add_leaf_cfs_rq`函数中解释这个list的作用。
 
 ### `update_load_avg`函数
 
@@ -1177,6 +1177,8 @@ static long calc_group_shares(struct cfs_rq *cfs_rq)
 
 在记录这个函数的执行逻辑之前先记录注释中的内容，这些内容有助于理解代码中的计算逻辑，注释中`grq->load.weight`、`grp->avg.load_avg`之中`grp`指的是任务组在某个cpu上的cfs_rq。任务组在某个cpu上的实体的权重计算公式为注释中如等式(1)所示，但是等式(1)之中存在计算比较慢求和计算，使用`load_avg`替换等式(1)之中的实体权重`weight`得到等式(3)。使用了`load_avg`提到`weight`带来的弊端是`load_avg`的变化是比较缓慢的，这在一些边界情况中会引来误差。注释中还提到了一种特殊情况，在任务组之中只有一个任务的情况下只有一个cpu需要执行任务而其他的cpu都是空闲状态，此时可以对等式(1)进行化简得到等式(4)，此时结果永远是任务组权重这一个恒定的值，这种情况类似于在单核cpu之中运行。值得注意的是等式(4)为等式(1)在特殊情况下推导出来的，但想要使用等式(3)替代等式(1)，这就意味着需要使用等式(3)来近似等式(4)的结果，于是有了在等式(3)中除数之中使用任务组在某个cpu上cfs_rq的权重替代其`load_avg`的想法，形成了等式(5)。在某些情况下等式(5)中会出现除数为0的情况，例如任务组之中只有一个任务等，使用等式(6)来替代等式(5)修复这个问题，等式(6)就是代码中实现的计算逻辑。
 
+结合注释中的内容理解这个函数的代码实现比较容易，弄清楚代码中几个变量的含义就可以明确整个计算流程中每一步在做什么，其中代码之中`tg_shares`为任务组的权重，对应等式(6)之中`tg->weight`项；`load`对应等式(6)之中的`max(grq->load.weight, grq->avg.load_avg)`的结果；`tg_weight`最终的结果对应等式(6)之中`tg_load_avg'`；进行除法计算之前的`shares`对应等式(6)中的乘法计算结果，注意这里进行乘法的时候使用的是`load`而非等式中要求的cfs_rq的权重，这是考虑到cfs_rq的权重可能为0；进行除法之后的`shares`对应等式(6)的计算结果，得到最终的计算结果之后要将结果限制在合理的取值范围之中。
+
 ### `account_entity_enqueue`函数
 
 ```c
@@ -1199,3 +1201,122 @@ account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 ```
 
 这个函数执行调度实体进入cfs_rq时cfs_rq之中的统计字段更新，首先使用`update_load_weight`函数将实体的权重加入到cfs_rq的权重之中，随后递增cfs_rq之中可运行的任务统计，最后若任务为一个空闲任务更新cfs_rq之中可运行的空闲任务统计。上述更新过程中若发现实体对应一个任务，则将其加入到rq的`cfs_tasks`队列之中，这个队列管理rq之中有`CFS`调度类管理的任务。
+
+### `__enqueue_entity`函数
+
+```c
+/*
+ * Enqueue an entity into the rb-tree:
+ */
+static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	rb_add_cached(&se->run_node, &cfs_rq->tasks_timeline, __entity_less);
+}
+```
+
+最终将实体放入到cfs_rq是在这个函数之中进行的，这个函数将实体放入到cfs_rq内部维护的一颗红黑树之中，红黑树之中实体比较使用了`__entity_less`函数，这个函数比较的是两个实体的虚拟运行时间。
+
+### `list_add_leaf_cfs_rq`函数
+
+```c
+static inline bool list_add_leaf_cfs_rq(struct cfs_rq *cfs_rq)
+{
+	struct rq *rq = rq_of(cfs_rq);
+	int cpu = cpu_of(rq);
+
+	if (cfs_rq->on_list)
+		return rq->tmp_alone_branch == &rq->leaf_cfs_rq_list;
+
+	cfs_rq->on_list = 1;
+
+	/*
+	 * Ensure we either appear before our parent (if already
+	 * enqueued) or force our parent to appear after us when it is
+	 * enqueued. The fact that we always enqueue bottom-up
+	 * reduces this to two cases and a special case for the root
+	 * cfs_rq. Furthermore, it also means that we will always reset
+	 * tmp_alone_branch either when the branch is connected
+	 * to a tree or when we reach the top of the tree
+	 */
+	if (cfs_rq->tg->parent &&
+	    cfs_rq->tg->parent->cfs_rq[cpu]->on_list) {
+		/*
+		 * If parent is already on the list, we add the child
+		 * just before. Thanks to circular linked property of
+		 * the list, this means to put the child at the tail
+		 * of the list that starts by parent.
+		 */
+		list_add_tail_rcu(&cfs_rq->leaf_cfs_rq_list,
+			&(cfs_rq->tg->parent->cfs_rq[cpu]->leaf_cfs_rq_list));
+		/*
+		 * The branch is now connected to its tree so we can
+		 * reset tmp_alone_branch to the beginning of the
+		 * list.
+		 */
+		rq->tmp_alone_branch = &rq->leaf_cfs_rq_list;
+		return true;
+	}
+
+	if (!cfs_rq->tg->parent) {
+		/*
+		 * cfs rq without parent should be put
+		 * at the tail of the list.
+		 */
+		list_add_tail_rcu(&cfs_rq->leaf_cfs_rq_list,
+			&rq->leaf_cfs_rq_list);
+		/*
+		 * We have reach the top of a tree so we can reset
+		 * tmp_alone_branch to the beginning of the list.
+		 */
+		rq->tmp_alone_branch = &rq->leaf_cfs_rq_list;
+		return true;
+	}
+
+	/*
+	 * The parent has not already been added so we want to
+	 * make sure that it will be put after us.
+	 * tmp_alone_branch points to the begin of the branch
+	 * where we will add parent.
+	 */
+	list_add_rcu(&cfs_rq->leaf_cfs_rq_list, rq->tmp_alone_branch);
+	/*
+	 * update tmp_alone_branch to points to the new begin
+	 * of the branch
+	 */
+	rq->tmp_alone_branch = &cfs_rq->leaf_cfs_rq_list;
+	return false;
+}
+```
+
+leaf cfs_rq指的是调度层次之中一类特殊的cfs_rq，这类cfs_rq之中保存的实体对应的是任务，这个函数将一个cpu之中的leaf cfs_rq都放到一个cpu的rq之中的列表之中，若之后记录`CFS`的其他函数使用到这个列表，在详细记录这个列表的作用以及相关机制，这里仅仅记录这个函数的流程。
+
+`rq`为cfs_rq所在cpu的任务队列，这个队列是Linux内核之中调度框架之中的任务队列，不是CFS调度类使用的任务队列，`rq`中的`leaf_cfs_rq_list`就是保存leaf cfs_rq队列的头节点。结合注释可以看到，`tmp_alone_branch`主要是在指向新的`cfs_rq`插入`rq`的`leaf_cfs_rq_list`时的位置，在一些情况之中需要借助它进行判断：若`cfs_rq`已经在队列之中则返回调度层级中的父队列是否已经在`rq`的`leaf_cfs_rq_list`之中；若这个`cfs_rq`有父队列并且父队列已经在`rq`的`leaf_cfs_rq_list`之中，直接将`cfs_rq`加入到父队列之中`leaf_cfs_rq_list`的队尾，并且将`rq`的`tmp_alone_branch`指向`rq`的`leaf_cfs_rq_list`表示父队列已经在`rq`的`leaf_cfs_rq_list`之中；若父队列不存在，这意味着`cfs_rq`位于调度层级之中最顶层，则先将`cfs_rq`加入到`rq`的`leaf_cfs_rq_list`之中；若父队列还没有放到`rq`的`leaf_cfs_rq_list`之中，则将`cfs_rq`加入到`tmp_alone_branch`指向的列表之中位置之后并且让`tmp_alone_branch`指向新加入的`cfs_rq`，这样当`cfs_rq`的父队列需要入队的时候可以快速找到自己所在的位置。
+
+这里结合一个例子说明`rq`的`leaf_cfs_rq_list`是怎样的，例如任务组层级为：
+
+```c
+Root CFS RQ
+│
+├── Parent CFS RQ (Group A)
+│   ├── Child1 CFS RQ
+│   └── Child2 CFS RQ
+│
+└── Sibling CFS RQ (Group B)
+    ├── Child3 CFS RQ
+    └── Child4 CFS RQ
+```
+
+层级之中`Child CFS RQ`为leaf cfs_rq，那么`rq`中`leaf_cfs_rq_list`队列的内容为：
+
+```
+rq->leaf_cfs_rq_list = [
+  Root CFS RQ,
+  Parent CFS RQ (Group A),
+  Child1 CFS RQ,
+  Child2 CFS RQ,
+  Sibling CFS RQ (Group B),
+  Child3 CFS RQ,
+  Child4 CFS RQ
+]
+```
+
