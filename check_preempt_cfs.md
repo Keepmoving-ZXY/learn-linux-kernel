@@ -108,3 +108,49 @@ preempt:
 
 `preempt`标记处的代码调用`resched_curr`函数为正在运行的任务添加`TIF_NEED_RESCHED`标记，这个函数的流程在`task_wake_up.md`文件中有详细记录。若正在运行的任务没有在rq之中并且不是空闲任务才考虑设置`last_buddy`，`last_buddy`相关的内容直接忽略。这里值得注意的是`se->on_rq`可能为0，`se`对应正在运行任务的调度实体所以此时`on_rq`本不应该为0，这是一种不一致的状态，在内核执行任务切换过程中可能会出现这种不一致的状态。
 
+### `wakeup_preempt_entity`函数
+
+```c
+static int
+wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
+{
+	s64 gran, vdiff = curr->vruntime - se->vruntime;
+
+	if (vdiff <= 0)
+		return -1;
+
+	gran = wakeup_gran(se);
+	if (vdiff > gran)
+		return 1;
+
+	return 0;
+}
+```
+
+这个函数判断正在运行任务的虚拟运行时间与被唤醒任务虚拟运行时间的差值与阈值的大小来确定是否允许被唤醒的任务抢占正在运行的任务，阈值在`gran`变量之中保存，阈值由`wakeup_gran`函数给出，接下来记录这个函数的流程。
+
+### `wakeup_gran`函数
+
+```c
+static unsigned long wakeup_gran(struct sched_entity *se)
+{
+	unsigned long gran = sysctl_sched_wakeup_granularity;
+
+	/*
+	 * Since its curr running now, convert the gran from real-time
+	 * to virtual-time in his units.
+	 *
+	 * By using 'se' instead of 'curr' we penalize light tasks, so
+	 * they get preempted easier. That is, if 'se' < 'curr' then
+	 * the resulting gran will be larger, therefore penalizing the
+	 * lighter, if otoh 'se' > 'curr' then the resulting gran will
+	 * be smaller, again penalizing the lighter task.
+	 *
+	 * This is especially important for buddies when the leftmost
+	 * task is higher priority than the buddy.
+	 */
+	return calc_delta_fair(gran, se);
+}
+```
+
+这个函数根据被唤醒任务的权重将`sysctl_sched_wakeup_granularity`的值进行缩放，得到在`wakeup_preempt_entity`函数使用的阈值。可以把`sysctl_sched_wakeup_granularity`认为是任务唤醒粒度，它的作用是降低任务抢占发生的频率，缩放过程对应于将其转化为虚拟运行时间。在这个函数的注释之中提到，使用被唤醒任务的权重而非当前正在运行任务的权重计算虚拟运行时间的好处是使得低权重的任务获得更少的运行机会，主要的机制为：若正在运行任务权重更大那么缩放之后的唤醒粒度更小，这样不利于小权重任务抢占大权重任务，若被唤醒的任务权重更大则缩放之后的唤醒力度更大，这样有利于大权重任务抢占小权重任务。真正的缩放在`calc_delta_fair`函数之中实现，这个函数的详细流程记录见`task_fork_cfs.md`。
