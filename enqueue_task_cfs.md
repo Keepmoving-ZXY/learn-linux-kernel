@@ -82,7 +82,7 @@ enqueue_throttle:
 }
 ```
 
-这里先关注两个循环（`for_each_sched_entity`）中的内容，这两个循环涉及到内核的任务组调度功能，关于这个功能的详细介绍见[task_group](https://blogs.oracle.com/linux/post/cfs-group-scheduling)，从介绍中可以看到在任务组调度功能之中，调度实体被划分到了多个层级，有的层次中调度实体对应一个任务组、有的层级中的调度实体对应一个任务，这两个`for`循环都是对于任务`p`对应的调度实体以及上级每个层级与之关联的调度实体而言的。第一个`for`循环用于将`p`对应的实体以及每个层级中与这个实体关联的实体放入到rq之中，第二个`for`循环用于更新平均负载、任务组的可运行任务相关统计字段、重新计算任务组实体的权重。两个循环之后调用`add_nr_running`更新cfs_rq中正在运行任务的计数并进行超载检查，最后调用`hrtick_update`更新高精度定时器。
+这里先关注两个循环（`for_each_sched_entity`）中的内容，这两个循环涉及到内核的任务组调度功能，关于这个功能的详细介绍见[task_group](https://blogs.oracle.com/linux/post/cfs-group-scheduling)，从介绍中可以看到在任务组调度功能之中，调度实体被划分到了多个层级，有的层次中调度实体对应一个任务组、有的层级中的调度实体对应一个任务，这两个`for`循环都是对于任务`p`对应的调度实体以及上级每个层级与之关联的调度实体而言的。第一个`for`循环用于将`p`对应的实体以及每个层级中与这个实体关联的实体放入到rq之中，第二个`for`循环用于更新平均负载、任务组的可运行任务相关统计字段、重新计算任务组实体的权重。两个循环之后调用`add_nr_running`更新cfs_rq中正在运行任务的计数并进行超载检查，最后调用`hrtick_update`设置新的高精度定时器。
 
 这里仅仅是简单整理一下这个函数的整体流程，后边会具体记录这其中许多函数的流程，被忽略的函数除外。这个函数中还隐藏着一个有意思的处理方式，这种涉及到了两个字段的更新（`h_nr_running`、`idle_h_nr_running`），这两个字段为cfs_rq的统计字段，代表了在当前的调度层级以及下层之中正在运行的实体、优先级极低（任务的调度策略被指定为了`SCHED_IDLE`）的任务。先以`h_nr_running`为例，当任务`p`对应的实体以及调度层级中与之关联的实体都放入到cfs_rq之中时，每个层级之中新增的正在运行的实体为2，但是在第一个`for`循环之中只为每一层的cfs_rq中这个字段递增，这个看起来很奇怪，因为这里需要2次递增，直到看到第二个`for`循环之中的代码才知道第二次递增在这个循环之中。`idle_h_nr_running`的数值更新逻辑类似，也是分到了两个`for`循环之中完成数值递增，只不过在某个层级调度实体对应的任务组为`SCHED_IDLE`组时才开始更新。
 
@@ -1320,3 +1320,53 @@ rq->leaf_cfs_rq_list = [
 ]
 ```
 
+### `hrtick_update`函数
+
+```c
+/*
+ * called from enqueue/dequeue and updates the hrtick when the
+ * current task is from our class and nr_running is low enough
+ * to matter.
+ */
+static void hrtick_update(struct rq *rq)
+{
+	struct task_struct *curr = rq->curr;
+
+	if (!hrtick_enabled_fair(rq) || curr->sched_class != &fair_sched_class)
+		return;
+
+	if (cfs_rq_of(&curr->se)->nr_running < sched_nr_latency)
+		hrtick_start_fair(rq, curr);
+}
+```
+
+这个函数只有在启用了高精度定时器、参数`rq`中正在运行任务使用的调度类为CFS时才会起作用，当正在运行任务所在的cfs_rq中可运行任务数量小于`sched_nr_latency`时执行`hrtick_start_fair`函数并rq之中传入正在运行的任务，`hrtick_start_fair`函数会设置一个新的高精度定时器，这个定时器的触发时间为正在运行任务时间片耗尽的时间，接下来会详细记录这个函数的流程。从代码之中可以看到，不是所有的情况下都会执行`hrtick_start_fair`函数设置新的高精度定时器，这里使用了`sched_nr_latency`当作阈值，`sched_nr_latency`的值由$\frac{sysctl\_sched\_latency}{sysctl\_sched\_min\_granularity}$计算的来，接下来详细记录`sysctl_sched_latency`以及`sysct_sched_min_granularity`，通过这两个值来理解`sysctl_nr_latency`的含义。
+
+`sysctl_sched_latency`为内核认为比较理想的调度延迟，调度延迟指的是rq之中每个任务至少运行一次的时间，但是如果内核之中任务数量过大可能会导致每个任务得到的运行时间很短、任务调度过程频繁发生，任务调度占用的时间会比较高。这个时候约定一个任务最少的运行时间`sysctl_sched_min_granularity`，这个运行时间不考虑任务权重，然后由这个时间乘以rq中的可运行任务得到调度延迟。结合这些信息可以得到`sched_nr_latency`为rq中任务数量是多还是少的一个阈值，超过这个值基于`sysctl_sched_min_granularity`计算调度延迟，没有超过这个值则使用内核认为比较理想的调度延迟。
+
+### `hrtick_start_fair`函数
+
+```c
+static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
+{
+	struct sched_entity *se = &p->se;
+	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+	SCHED_WARN_ON(task_rq(p) != rq);
+
+	if (rq->cfs.h_nr_running > 1) {
+		u64 slice = sched_slice(cfs_rq, se);
+		u64 ran = se->sum_exec_runtime - se->prev_sum_exec_runtime;
+		s64 delta = slice - ran;
+
+		if (delta < 0) {
+			if (task_current(rq, p))
+				resched_curr(rq);
+			return;
+		}
+		hrtick_start(rq, delta);
+	}
+}
+```
+
+当这个函数从`hrtick_udpate`函数之中调用时，`p`为rq之中正在运行的任务，`p`所在的rq由函数参数`rq`给出。这个函数调用`sched_slice`函数计算任务`p`获得到的时间片、计算任务`p`的时间片中已经使用的时间，这样可以推断出`delta`的含义为任务`p`的时间片中还未使用的时间。若`delta`小于0则认为任务`p`的时间统计需要更新，调用`resched_curr`函数更新任务的时间统计然后返回；若`delta`大于0则调用`hrtick_start`设置一个新的高精度定时器，定时器触发的时间正好是任务`p`时间片耗尽的时候。上述过程中提到的`resched_curr`函数详细流程在`task_wake_up.md`之中记录、`sched_slice`函数详细流程在`task_fork_cfs.md`之中记录、`hrtick_start`函数在`schedule.md`之中记录。

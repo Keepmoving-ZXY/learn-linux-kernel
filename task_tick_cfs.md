@@ -72,4 +72,6 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 }
 ```
 
-这个函数更新cfs_rq以及实体所在任务组的统计字段、确定正在执行的任务是否会被抢占，若确定任务会被抢占则为任务添加`TIF_NEED_RESCHED`标记。这个函数首先更新正在运行任务的时间统计、更新任务以及所在的cfs_rq的平均负载、更新任务组在某个cpu上实体的权重，`update_curr`函数的流程记录见`task_fork_cfs.md`、`update_load_avg`以及`update_cfs_group`两个函数的流程记录见`enqueue_task_fair.md`。接下来的内容涉及到周期性定时器与高精度定时器：若`queued`为1则表示此函数是从高精度定时器触发的`hrtick`函数之中调用，直接调用`resched_curr`设置任务抢占标记然后返回，可以直接进行抢占而不需要任何检查的原因在后边的`hrtick_update`函数流程记录之中会提到；若`queued`为0则表示此函数是从周期性的定时器触发的函数`scheduler_tick`之中调用的，此时若cfs_rq中有活跃的高精度定时器直接退出，原因会在`hrtick_update`函数之中提到；若cfs_rq没有活跃的高精度定时器，调用`check_preempt_tick`函数确定是否可以抢占当前正在运行的任务。上述流程中提到的`resched_curr`函数的详细流程在`task_wake_up.md`中记录，`hrtick`函数的详细流程在`schedule.md`文件中记录，接下来记录`hrtick_update`、`check_preempt_tick`两个函数的详细流程。
+这个函数更新cfs_rq以及实体所在任务组的统计字段、确定正在执行的任务是否会被抢占，若确定任务会被抢占则为任务添加`TIF_NEED_RESCHED`标记。这个函数首先更新正在运行任务的时间统计、更新任务以及所在的cfs_rq的平均负载、更新任务组在某个cpu上实体的权重，`update_curr`函数的流程记录见`task_fork_cfs.md`、`update_load_avg`以及`update_cfs_group`两个函数的流程记录见`enqueue_task_fair.md`。接下来的内容涉及到周期性定时器与高精度定时器：若`queued`为1则表示此函数是从高精度定时器触发的`hrtick`函数之中调用，直接调用`resched_curr`设置任务抢占标记然后返回，可以直接进行抢占而不需要检查的原因是在设置高精度定时器时将触发时间设置为了rq中正在执行任务的时间片耗尽的时刻；若`queued`为0则表示此函数是从周期性的定时器触发的函数`scheduler_tick`之中调用的，此时若cfs_rq中有活跃的高精度定时器直接退出，原因会在`hrtick_update`函数之中提到；若cfs_rq没有活跃的高精度定时器，调用`check_preempt_tick`函数确定是否可以抢占当前正在运行的任务。上述流程中提到的`resched_curr`函数的详细流程在`task_wake_up.md`中记录，`hrtick`函数的详细流程在`schedule.md`文件中记录，`hrtick_start_fair`函数详细流程在`enqueue_task_fair.md`文件中记录，`check_preempt_tick`两个函数的详细流程在后边记录，其他的函数忽略。
+
+
