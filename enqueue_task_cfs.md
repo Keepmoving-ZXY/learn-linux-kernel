@@ -1369,4 +1369,4 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 }
 ```
 
-当这个函数从`hrtick_udpate`函数之中调用时，`p`为rq之中正在运行的任务，`p`所在的rq由函数参数`rq`给出。这个函数调用`sched_slice`函数计算任务`p`获得到的时间片、计算任务`p`的时间片中已经使用的时间，这样可以推断出`delta`的含义为任务`p`的时间片中还未使用的时间。若`delta`小于0则认为任务`p`的时间统计需要更新，调用`resched_curr`函数更新任务的时间统计然后返回；若`delta`大于0则调用`hrtick_start`设置一个新的高精度定时器，定时器触发的时间正好是任务`p`时间片耗尽的时候。上述过程中提到的`resched_curr`函数详细流程在`task_wake_up.md`之中记录、`sched_slice`函数详细流程在`task_fork_cfs.md`之中记录、`hrtick_start`函数在`schedule.md`之中记录。
+当这个函数从`hrtick_udpate`函数之中调用时，`p`为rq之中正在运行的任务，`p`所在的rq由函数参数`rq`给出。这个函数调用`sched_slice`函数计算任务`p`获得到的时间片、计算任务`p`的时间片中已经使用的时间，这样可以推断出`delta`的含义为任务`p`的时间片中还未使用的时间。若`delta`小于0则认为任务`p`的时间统计需要更新，调用`resched_curr`函数更新任务的时间统计然后返回；若`delta`大于0则调用`hrtick_start`设置一个新的高精度定时器，定时器触发的时间正好是任务`p`时间片耗尽的时候。上述过程中提到的`resched_curr`函数详细流程在`task_wake_up.md`之中记录、`sched_slice`函数详细流程在`task_fork_cfs.md`之中记录、`hrtick_start`函数详细流程在`schedule.md`之中记录。
