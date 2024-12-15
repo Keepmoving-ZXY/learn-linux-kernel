@@ -87,5 +87,5 @@ dequeue_throttle:
 
 这个函数最后的部分调用`sub_nr_running`将rq之中可运行任务的数量递减，因为前边两个`for`循环的作用让rq之中所有的任务都是空闲任务时(`!was_sched_idle && sched_idle_rq(rq)`为`True`)将对此rq进行下一次负载均衡的时机提前到现在(`rq->next_balance = jiffies`)，调用`update_hrtick`更新高精度定时器。
 
-以上的流程中提到`update_load_avg`、`se_update_runnable`、`update_cfs_group`、、`hrtick_update`函数流程详细记录见`enqueue_task_cfs.md`，`sched_idle_rq`、`dequeue_entity`、`sub_nr_running`、`set_next_buddy`函数流程在后边记录，其他函数忽略。
+以上的流程中提到的`update_load_avg`、`se_update_runnable`、`update_cfs_group`、`hrtick_update`函数流程详细记录见`enqueue_task_cfs.md`，`sched_idle_rq`、`dequeue_entity`、`sub_nr_running`、`set_next_buddy`函数流程在后边记录，其他函数忽略。
 
