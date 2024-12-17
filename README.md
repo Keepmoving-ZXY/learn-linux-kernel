@@ -9,3 +9,7 @@
 4.`enqueue_task_fair.md`中的内容是`enqueue_task_fair`函数的流程记录，这个函数是内核调度机制中`enqueue_task`方法的CFS实现；
 
 5.`check_preempt_cfs.md`中的内容是`check_preempt_wakeup`函数的流程记录，这个函数是内核调度机制中`check_preempt_curr`方法的CFS实现；
+
+6.`dequeue_task_cfs.md`中的内容是`dequeue_task_fair`函数的流程记录，这个函数是内核调度机制中`dequeue_task`方法的CFS实现；
+
+7.`task_tick_cfs.md`中的内容是`task_tick_fair`函数的流程记录，这个函数是内核调度机制中`task_tick_fair`方法的CFS实现；
