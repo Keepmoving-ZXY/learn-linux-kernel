@@ -182,3 +182,209 @@ idle:
 #### 标签`idle`
 
 这部分的内容对应代码之中`idle`处的代码，这些代码在运行队列`rq`不为空的前提下执行。调用`newidle_balance`函数进行cpu之间任务的负载均衡，尝试从其他的cpu之中拉去可运行的任务到当前的cpu之中，若返回`-1`意味着没有找到关联CFS调度类的任务，返回-1；若返回值大于0则意味着拉去到了新的任务，代码跳转到标签`again`处即函数开始的位置继续执行；若返回值等于0意味着没有找到可以运行的任务，则调用`update_idle_rq_clock_pelt`函数更新空闲运行队列的相关统计并返回0。在后边记录这里提到的`newidle_balance`、`update_idle_rq_clock_pelt`两个函数流程，其他的内容忽略。
+
+### `newidle_balance`函数
+
+```c
+/*
+ * newidle_balance is called by schedule() if this_cpu is about to become
+ * idle. Attempts to pull tasks from other CPUs.
+ *
+ * Returns:
+ *   < 0 - we released the lock and there are !fair tasks present
+ *     0 - failed, no new tasks
+ *   > 0 - success, new (fair) tasks present
+ */
+static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
+{
+	unsigned long next_balance = jiffies + HZ;
+	int this_cpu = this_rq->cpu;
+	u64 t0, t1, curr_cost = 0;
+	struct sched_domain *sd;
+	int pulled_task = 0;
+
+	update_misfit_status(NULL, this_rq);
+
+	/*
+	 * There is a task waiting to run. No need to search for one.
+	 * Return 0; the task will be enqueued when switching to idle.
+	 */
+	if (this_rq->ttwu_pending)
+		return 0;
+
+	/*
+	 * We must set idle_stamp _before_ calling idle_balance(), such that we
+	 * measure the duration of idle_balance() as idle time.
+	 */
+	this_rq->idle_stamp = rq_clock(this_rq);
+
+	/*
+	 * Do not pull tasks towards !active CPUs...
+	 */
+	if (!cpu_active(this_cpu))
+		return 0;
+
+	/*
+	 * This is OK, because current is on_cpu, which avoids it being picked
+	 * for load-balance and preemption/IRQs are still disabled avoiding
+	 * further scheduler activity on it and we're being very careful to
+	 * re-start the picking loop.
+	 */
+	rq_unpin_lock(this_rq, rf);
+
+	rcu_read_lock();
+	sd = rcu_dereference_check_sched_domain(this_rq->sd);
+
+	if (!READ_ONCE(this_rq->rd->overload) ||
+	    (sd && this_rq->avg_idle < sd->max_newidle_lb_cost)) {
+
+		if (sd)
+			update_next_balance(sd, &next_balance);
+		rcu_read_unlock();
+
+		goto out;
+	}
+	rcu_read_unlock();
+
+	raw_spin_rq_unlock(this_rq);
+
+	t0 = sched_clock_cpu(this_cpu);
+	update_blocked_averages(this_cpu);
+
+	rcu_read_lock();
+	for_each_domain(this_cpu, sd) {
+		int continue_balancing = 1;
+		u64 domain_cost;
+
+		update_next_balance(sd, &next_balance);
+
+		if (this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost)
+			break;
+
+		if (sd->flags & SD_BALANCE_NEWIDLE) {
+
+			pulled_task = load_balance(this_cpu, this_rq,
+						   sd, CPU_NEWLY_IDLE,
+						   &continue_balancing);
+
+			t1 = sched_clock_cpu(this_cpu);
+			domain_cost = t1 - t0;
+			update_newidle_cost(sd, domain_cost);
+
+			curr_cost += domain_cost;
+			t0 = t1;
+		}
+
+		/*
+		 * Stop searching for tasks to pull if there are
+		 * now runnable tasks on this rq.
+		 */
+		if (pulled_task || this_rq->nr_running > 0 ||
+		    this_rq->ttwu_pending)
+			break;
+	}
+	rcu_read_unlock();
+
+	raw_spin_rq_lock(this_rq);
+
+	if (curr_cost > this_rq->max_idle_balance_cost)
+		this_rq->max_idle_balance_cost = curr_cost;
+
+	/*
+	 * While browsing the domains, we released the rq lock, a task could
+	 * have been enqueued in the meantime. Since we're not going idle,
+	 * pretend we pulled a task.
+	 */
+	if (this_rq->cfs.h_nr_running && !pulled_task)
+		pulled_task = 1;
+
+	/* Is there a task of a high priority class? */
+	if (this_rq->nr_running != this_rq->cfs.h_nr_running)
+		pulled_task = -1;
+
+out:
+	/* Move the next balance forward */
+	if (time_after(this_rq->next_balance, next_balance))
+		this_rq->next_balance = next_balance;
+
+	if (pulled_task)
+		this_rq->idle_stamp = 0;
+	else
+		nohz_newidle_balance(this_rq);
+
+	rq_repin_lock(this_rq, rf);
+
+	return pulled_task;
+}
+```
+
+这个函数的内容涉及到了Linux内核的调度域等概念，这些概念参见[内核调度域说明](https://docs.kernel.org/scheduler/sched-domains.html)。
+
+#### 简单情况处理
+
+这部分对应的代码为从函数开始到`raw_spin_rq_unlock`函数调用位置，代码流程为一些比较简单情况的处理。若运行队列`rq`之中已经有任务正在等待运行或者当前cpu处于不活跃状态(`!cpu_active(this_cpu)`)则直接返回，这里通过`ttwu_pending`来标记是否存在任务需要等待运行，`ttwu_pending`的设置`try_to_wake_up`函数中设置，这个函数的详细记录见`task_wake_up.md`。运行队列中`idle_stamp`字段保存运行队列进入空闲状态的时间，这个时间不是系统的当前时间而是运行队列的当前时间，运行队列之中需一个相对稳定而不是一直在变化的时间用于各种统计计算，所以运行队列会单独维护一个当前时间。使用`rcu_read_lock`、`rcu_read_unlock`标记一个RCU读临界区，在这个临界区中若根调度域没有出现过载的情况、当前运行队列处于空闲状态的时间小于任务负载均衡自身消耗的时间(``max_newidle_lb_cost`)，调用`update_next_balance`更新下一次执行负载均衡的时间，跳转到标签`out`处执行。上述流程中提到的`update_next_balance`函数的详细流程在后边记录，其他的函数忽略。
+
+#### 从其他cpu中拉取任务
+
+这部分对应代码中`raw_spin_rq_unlock`与`raw_spin_rq_lock`这两个函数调用位置之间的代码，这两个函数用于释放、获取运行队列之中的锁：这个过程中不需要对运行队列自身进行修改，所以先释放在`__schedule`函数间接调用此函数之前获取到的运行队列之中的锁；尝试从调度域其他cpu中拉取任务过程结束之后需要重新获取运行队列之中的锁，一方面是因为接下来要对运行队列进行修改、另外一方面是保持`__schedule`间接调用此函数时锁的一致性。
+
+设置`t0`为尝试从调度域其他cpu中拉取任务的开始时间，调用`update_blocked_averages`函数更新运行队列之中平均负载统计，这个函数名之中`blocked`含义为`blocked load`，结合`update_tg_cfs_util`之前的注释认为`blocked load`为运行队列之中任务的历史权重，在计算平均负载的时候会考虑任务的历史权重。从调度域其他cpu之中拉取任务对应的代码在`for_each_domain`这个循环之中，这个循环遍历当前cpu所在的调度域，对于每个调度域调用`update_next_balance`函数更新此调度域下次执行负载均衡的时间、调用`load_balance`函数尝试从调度域中其他cpu拉取一个任务、调用`update_newidle_cost`更新调度域负载均衡消耗的时间，若已经拉取到任务或者运行队列中已经有可运行的任务或者运行队列中有等待运行的任务直接退出调度域遍历过程。在循环过程中还会记录对正在遍历的调度域中调用`load_balance`函数进行负载均衡的时间，更新正在遍历的调度域的负载均衡所需时间，还会判断运行队列处于空闲状态时间(`avg_idle`)与尝试从其他cpu中拉取任务累计消耗时间(`curr_cost`)、负载均衡操作消耗的最长时间(`max_newidle_lb_cost`)，若前者小于后者则认为从其他的cpu中拉取任务是低效的、直接放弃未遍历到的调度域。
+
+在后边详细记录上述流程中提到的`update_blocked_averages`、`update_newidle_cost`、`update_next_balance`函数，`load_balance`内容十分复杂需要在一个文档之中单独记录流程，其他的函数忽略。
+
+#### 任务拉取结束的检查
+
+这部分对应代码中调用`raw_spin_rq_lock`位置到标签`out`之间的代码，这部分代码更新当前运行队列之中负载均衡操作消耗的最长时间统计(`this_rq->max_idle_balance_cost`)，对两种特殊情况进行判断：若CFS运行队列之中有可运行的任务并且没能从其他的cpu中拉取任务，设置`pulled_task`为1表示已经有新的、可运行的任务了；若运行队列中可运行的任务大于CFS运行队列中可运行的任务，这意味着运行队列之中有任务关联了优先级更高的调度类，设置`pulled_task`为`-1`提醒调用者这种情况。
+
+#### 标签`out`
+
+若当前的运行队列设置的下次负载均衡运行(`this_rq->max_idle_balance_cost`)时间晚于负载均衡过程中计算出来的时间(`next_balance`)，则提前当前运行队列下次负载均衡运行时间至负载均衡过程中计算出来的时间。若已经拉取到任务或者当前运行队列之中有优先级更高的任务，运行队列即将退出空闲状态，重置`idle_stamp`为0；若没有拉取到任务则调用`nohz_newidle_balance`函数进行负载均衡相关的检查工作。在后边详细记录`nohz_newidle_balance`函数流程，其他的函数忽略。
+
+### `update_next_balance`函数
+
+```c
+static inline void
+update_next_balance(struct sched_domain *sd, unsigned long *next_balance)
+{
+	unsigned long interval, next;
+
+	/* used by idle balance, so cpu_busy = 0 */
+	interval = get_sd_balance_interval(sd, 0);
+	next = sd->last_balance + interval;
+
+	if (time_after(*next_balance, next))
+		*next_balance = next;
+}
+```
+
+这个函数计算下一次运行负载均衡的时间，由`get_sd_balance_interval`计算调度域`sd`上负载均衡的运行间隔，加上调度域`sd`最近一次运行负载均衡的时间得到下一次负载均衡的运行时间。在`newidle_balance`函数会对多个调度域计算下一次负载均衡运行的时间，从函数之中最后一个`if`中的代码可以看到下一次负载均衡运行的时间总是目前处理的调度域中最早触发负载均衡的时间。`get_sd_balance_interval`函数是这个函数的重点，接下来关注这个函数的内容。
+
+### `get_sd_balance_interval`函数
+
+```c
+static inline unsigned long
+get_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
+{
+	unsigned long interval = sd->balance_interval;
+
+	if (cpu_busy)
+		interval *= sd->busy_factor;
+
+	/* scale ms to jiffies */
+	interval = msecs_to_jiffies(interval);
+
+	/*
+	 * Reduce likelihood of busy balancing at higher domains racing with
+	 * balancing at lower domains by preventing their balancing periods
+	 * from being multiples of each other.
+	 */
+	if (cpu_busy)
+		interval -= 1;
+
+	interval = clamp(interval, 1UL, max_load_balance_interval);
+
+	return interval;
+}
+```
+
+这个函数基于调度域默认的负载均衡时间间隔(`balance_interval`)，结合当前cpu是否处于忙碌状态，计算出一个负载均衡时间间隔。若当前cpu处于忙碌状态，将调度域默认的负载均衡时间间隔放大，减少负载均衡的运行次数。在当前cpu处于忙碌状态的时候，为了防止不同层次的调度域执行负载均衡的时间成为倍数关系造成的不同层次调度域连续运行负载均衡操作，递减调度域`sd`的时间间隔。最后为调度域`sd`运行负载均衡的时间间隔加一个上限、下限限制作为最终的结果并返回。
