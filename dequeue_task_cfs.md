@@ -1,4 +1,4 @@
-本文档记录`dequeue_task_fair`函数的详细流程，这个函数是CFS调度类提供的`dequeue_task`方法的实现，当一个任务进入睡眠状态或者退出时需要将其从rq之中移除，从rq之中移除时会调用CFS提供的`dequeue_task`方法实现，更新CFS调度类内部的数据结构。
+本文档记录`dequeue_task_fair`函数的详细流程，这个函数是CFS调度类提供的`dequeue_task`方法的实现，当一个任务进入睡眠状态或者退出时需要将其从运行队列之中移除，从运行队列之中移除时会调用CFS提供的`dequeue_task`方法实现，更新CFS调度类内部的数据结构。
 
 ### `dequeue_task_fair`函数
 
@@ -79,13 +79,13 @@ dequeue_throttle:
 }
 ```
 
-这个函数的主要流程都在两个`for`循环之中执行，这两个`for`循环都是在遍历调度层级之中的每一级的实体，遍历过程中更新cfs_rq之中可运行任务(`h_nr_running`)与可运行空闲任务(`idle_h_nr_running`)的统计，这里是减小这两个统计的值并且这两个统计的值是在两个循环之中更新的，而`enqueue_task_fair`是增加这两个统计的值，这两个统计的更新逻辑结合`enqueue_task_fair`之中的解释理解，尤其需要注意为什么会在两个循环之中更新这两个统计的值。
+这个函数的主要流程都在两个`for`循环之中执行，这两个`for`循环都是在遍历调度层级之中的每一级的实体，遍历过程中更新CFS运行队列之中可运行任务(`h_nr_running`)与可运行空闲任务(`idle_h_nr_running`)的统计，这里是减小这两个统计的值并且这两个统计的值是在两个循环之中更新的，而`enqueue_task_fair`是增加这两个统计的值，这两个统计的更新逻辑结合`enqueue_task_fair`之中的解释理解，尤其需要注意为什么会在两个循环之中更新这两个统计的值。
 
-在第一个循环中对每个实体调用`dequeue_entity`函数更新任务以及任务组相关统计随后将任务从cfs_rq之中移除，这里需要注意的是并不是遍历到的所有的实体都需要从其所在的cfs_rq之中移除，当实体所在的cfs_rq之中还有任务时停止向上遍历，这里判断cfs_rq之中是否还有任务是通过当前实体所在cfs_rq的权重(`cfs_rq->load.weight`)是否为0来确定的。这里需要留意`parent_entity`返回的实体与`cfs_rq`之间的关系，它们是一个任务组在某个cpu上的实体以及运行队列，实体参与这个cpu上的任务调度、运行队列保存任务组之中可运行的任务。接下来关注cfs_rq的权重不为0时的处理，通过`parent_entity`获取当前实体在调度层级之中的上级实体，若任务`p`在时间片耗尽之前进入睡眠状态并且这一层没有被限流，那么将上级调度实体设置为这个实体所在cfs_rq之中期望接下来执行的任务对应的实体。这里通过`task_sleep`来判断任务`p`是否是一个在时间片耗尽之前就进入睡眠状态的任务，若`task_sleep`为1意味着调用这个函数的时候`flags`之中设置了`DEQUEUE_SLEEP`标志，这意味着正在执行的任务时间片还没有消耗完但要进入睡眠状态、新的任务要抢占正在运行的任务（若任务的时间片已经消耗完时进行抢占，任务处于可运行状态），可以结合`__schedule`函数之中`signal_pending_state(prev_state, prev)`为`False`时执行的代码逻辑理解。第二个`for`循环对于遍历到的每个实体调用`update_load_avg`函数更新实体对应任务和实体所在cfs_rq的平均负载、调用`se_update_runnable`函数更新任务组在某个cpu上实体的可运行任务统计、调用`update_cfs_group`更新任务组在某个cpu上实体的权重。
+在第一个循环中对每个实体调用`dequeue_entity`函数更新任务以及任务组相关统计随后将任务从CFS运行队列之中移除，这里需要注意的是并不是遍历到的所有的实体都需要从其所在的CFS运行队列之中移除，当实体所在的CFS运行队列之中还有任务时停止向上遍历，这里判断CFS运行队列之中是否还有任务是通过当前实体所在CFS运行队列的权重(`cfs_rq->load.weight`)是否为0来确定的。这里需要留意`parent_entity`返回的实体与CFS运行队列`cfs_rq`之间的关系，它们是一个任务组在某个cpu上的实体以及运行队列，实体参与这个cpu上的任务调度、运行队列保存任务组之中可运行的任务。接下来关注CFS运行队列的权重不为0时的处理，通过`parent_entity`获取当前实体在调度层级之中的上级实体，若任务`p`在时间片耗尽之前进入睡眠状态并且这一层没有被限流，那么将上级调度实体设置为这个实体所在CFS运行队列之中期望接下来执行的任务对应的实体。这里通过`task_sleep`来判断任务`p`是否是一个在时间片耗尽之前就进入睡眠状态的任务，若`task_sleep`为1意味着调用这个函数的时候`flags`之中设置了`DEQUEUE_SLEEP`标志，这意味着正在执行的任务时间片还没有消耗完但要进入睡眠状态、新的任务要抢占正在运行的任务（若任务的时间片已经消耗完时进行抢占，任务处于可运行状态），可以结合`__schedule`函数之中`signal_pending_state(prev_state, prev)`为`False`时执行的代码逻辑理解。第二个`for`循环对于遍历到的每个实体调用`update_load_avg`函数更新实体对应任务和实体所在CFS运行队列的平均负载、调用`se_update_runnable`函数更新任务组在某个cpu上实体的可运行任务统计、调用`update_cfs_group`更新任务组在某个cpu上实体的权重。
 
-这个函数调用了两次cfs_rq以及任务组统计指标的更新函数，例如`update_load_avg`、`se_update_runnable`、`update_cfs_group`这三个函数，第一次调用是在第一个`for`循环中执行`dequeue_entity`的时候由`dequeue_entity`函数调用，第二次调用是在第二个`for`循环之中，同样的在`enqueue_task_fair`之中也出现了调用这三个函数两次的情况。这背后的原因主要涉及到两点：第一点是调度层次中当前层次的统计指标变化会影响上级的统计指标计算，在后边详细说明是如何影响的；第二点是调度层级的每一层之中`h_nr_running`、`idle_h_hr_running`要考虑所有下层之中可运行任务数量、可运行的空闲任务数量变化，作者把数量变化的传递放到了两个循环之中，可以结合`enqueue_task_fair`函数中的内容理解这一点。可以结合代码理解第一点，在遍历过程中每一层都会递减这一层实体`se`所在cfs_rq中可运行任务统计(`h_nr_running`的值)，这个cfs_rq是任务组在当前cpu上的运行队列，这一层实体的父实体`pse`就是任务组在当前cpu上的调度实体，当遍历到父实体时会更新父实体`pse`的`runnable_weight`为`se`所属cfs_rq的可运行任务统计，这会进一步影响之后对`pse`执行`update_load_avg`时`load_avg`的计算。简而言之，把数量变化放到两个循环之中处理，每个循环之中当前遍历的实体所属cfs_rq统计指标的变化会影响接下来遍历到的实体。
+这个函数调用了两次CFS运行队列以及任务组统计指标的更新函数，例如`update_load_avg`、`se_update_runnable`、`update_cfs_group`这三个函数，第一次调用是在第一个`for`循环中执行`dequeue_entity`的时候由`dequeue_entity`函数调用，第二次调用是在第二个`for`循环之中，同样的在`enqueue_task_fair`之中也出现了调用这三个函数两次的情况。这背后的原因主要涉及到两点：第一点是调度层次中当前层次的统计指标变化会影响上级的统计指标计算，在后边详细说明是如何影响的；第二点是调度层级的每一层之中`h_nr_running`、`idle_h_hr_running`要考虑所有下层之中可运行任务数量、可运行的空闲任务数量变化，作者把数量变化的传递放到了两个循环之中，可以结合`enqueue_task_fair`函数中的内容理解这一点。可以结合代码理解第一点，在遍历过程中每一层都会递减这一层实体`se`所在CFS运行队列中可运行任务统计(`h_nr_running`的值)，这个CFS运行队列是任务组在当前cpu上的运行队列，这一层实体的父实体`pse`就是任务组在当前cpu上的调度实体，当遍历到父实体时会更新父实体`pse`的`runnable_weight`为`se`所属CFS运行队列的可运行任务统计，这会进一步影响之后对`pse`执行`update_load_avg`时`load_avg`的计算。简而言之，把数量变化放到两个循环之中处理，每个循环之中当前遍历的实体所属CFS运行队列统计指标的变化会影响接下来遍历到的实体。
 
-这个函数最后的部分调用`sub_nr_running`将rq之中可运行任务的数量递减，因为前边两个`for`循环的作用让rq之中所有的任务都是空闲任务时(`!was_sched_idle && sched_idle_rq(rq)`为`True`)将对此rq进行下一次负载均衡的时机提前到现在(`rq->next_balance = jiffies`)，调用`update_hrtick`更新高精度定时器。
+这个函数最后的部分调用`sub_nr_running`将rq之中可运行任务的数量递减，因为前边两个`for`循环的作用让运行队列之中所有的任务都是空闲任务时(`!was_sched_idle && sched_idle_rq(rq)`为`True`)将对此运行队列进行下一次负载均衡的时机提前到现在(`rq->next_balance = jiffies`)，调用`update_hrtick`更新高精度定时器。
 
 以上的流程中提到的`update_load_avg`、`se_update_runnable`、`update_cfs_group`、`hrtick_update`函数流程详细记录见`enqueue_task_cfs.md`，`sched_idle_rq`、`dequeue_entity`、`sub_nr_running`函数流程在后边记录，其他函数忽略。
 
@@ -100,7 +100,7 @@ static int sched_idle_rq(struct rq *rq)
 }
 ```
 
-这个函数判断一个rq之中是否只包含空闲任务，判断的方式为比较rq中可运行任务以及可运行空闲任务的数量，二者相等则意味着rq之中所有任务都是空闲任务。当rq中可运行任务为0时这种判断会误认为rq之中所有任务为空闲任务，需要在判断判断之中排除此种情况，因此会要求`nr_running`不为0。
+这个函数判断一个运行队列之中是否只包含空闲任务，判断的方式为比较运行队列中可运行任务以及可运行空闲任务的数量，二者相等则意味着运行队列之中所有任务都是空闲任务。当运行队列中可运行任务为0时这种判断会误认为运行队列之中所有任务为空闲任务，需要在判断判断之中排除此种情况，因此会要求`nr_running`不为0。
 
 ### `dequeue_entity`函数
 
@@ -167,7 +167,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 }
 ```
 
-若实体`se`对应一个任务并且这个任务要从运行此函数的当前cpu之中迁移出去，需要为`action`追加`DO_DETACH`标记，这个标记会导致在`update_load_avg`函数中从cfs_rq的`avg`以及`sum`指标中减去来自实体`se`的贡献。一个任务从cfs_rq之中移除时同步这个任务与其所在的cfs_rq、任务组统计信息的最后时机，这里调用`update_curr`函数更新正在运行任务的时间统计、调用`update_load_avg`将实体`se`对`avg`、`sum`指标的贡献同步到cfs_rq之中、调用`se_update_runnable`更新任务组在当前cpu上的实体的可运行任务统计。如果`se`对应的不是当前cpu中正在运行的任务，调用`__dequeue_entity`函数将实体`se`从当前cpu的cfs_rq之中将实体`se`的`on_rq`设置为0以表明实体已经不在rq之中、调用`account_entity_dequeue`函数将任务权重从cfs_rq之中移除。若实体`se`对的任务并非进入睡眠状态而从cfs_rq移除，要从任务的虚拟运行时间之中减去cfs_rq的最小运行时间，这是将任务的虚拟运行时间转换成相对虚拟运行时间。若实体`se`为任务组在当前cpu上的实体，重新计算这个实体的权重。若在`flags`之中同时指定了`DEQUEUE_SAVE`和`DEQUEUE_MOVE`标记，则意味着实体`se`对应的任务要离开当前的rq，此时调用`update_min_vruntime`函数更新cfs_rq的基准虚拟运行时间，结合调用场景理解：在`sched_move_task`函数要为将任务转移到新的rq之中，此时调用此函数时同时指定了`DEQUEUE_SAVE`和`DEQUEUE_MOVE`标记；在`set_user_nice`函数中调用此函数时指定了`DEQUEUE_SAVE`而没有指定`DEQUEUE_MOVE`。
+若实体`se`对应一个任务并且这个任务要从运行此函数的当前cpu之中迁移出去，需要为`action`追加`DO_DETACH`标记，这个标记会导致在`update_load_avg`函数中从CFS运行队列的`avg`以及`sum`指标中减去来自实体`se`的贡献。一个任务从CFS运行队列之中移除时同步这个任务与其所在的CFS运行队列、任务组统计信息的最后时机，这里调用`update_curr`函数更新正在运行任务的时间统计、调用`update_load_avg`将实体`se`对`avg`、`sum`指标的贡献同步到CFS运行队列之中、调用`se_update_runnable`更新任务组在当前cpu上的实体的可运行任务统计。如果`se`对应的不是当前cpu中正在运行的任务，调用`__dequeue_entity`函数将实体`se`从当前cpu的CFS运行队列之中将实体`se`的`on_rq`设置为0以表明实体已经不在运行队列之中、调用`account_entity_dequeue`函数将任务权重从CFS运行队列之中移除。若实体`se`对的任务并非进入睡眠状态而从CFS运行队列移除，要从任务的虚拟运行时间之中减去CFS运行队列的最小运行时间，这是将任务的虚拟运行时间转换成相对虚拟运行时间。若实体`se`为任务组在当前cpu上的实体，重新计算这个实体的权重。若在`flags`之中同时指定了`DEQUEUE_SAVE`和`DEQUEUE_MOVE`标记，则意味着实体`se`对应的任务要离开当前的运行队列，此时调用`update_min_vruntime`函数更新CFS运行队列的基准虚拟运行时间，结合调用场景理解：在`sched_move_task`函数要为将任务转移到新的运行队列之中，此时调用此函数时同时指定了`DEQUEUE_SAVE`和`DEQUEUE_MOVE`标记；在`set_user_nice`函数中调用此函数时指定了`DEQUEUE_SAVE`而没有指定`DEQUEUE_MOVE`。
 
 以上的流程之中涉及到的`update_curr`函数详细记录见`task_fork_cfs.md`，`update_load_avg`、`se_update_runnable`、`update_cfs_group`函数详细记录见`enqueue_task_cfs.md`，`update_min_vruntime`函数详细记录见`task_fork_cfs.md`，在后边详细记录`account_entity_dequeue`、`__dequeue_entity`这两个函数的流程，其他的函数忽略。
 
@@ -190,7 +190,7 @@ account_entity_dequeue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 }
 ```
 
-这个函数从cfs_rq的权重之中减去实体`se`的贡献，递减cfs_rq之中可运行任务的统计，若`se`对应的任务为一个空闲任务则递减cfs_rq中可运行的空闲任务统计，其他的内容忽略。
+这个函数从CFS运行队列的权重之中减去实体`se`的贡献，递减CFS运行队列之中可运行任务的统计，若`se`对应的任务为一个空闲任务则递减CFS运行队列中可运行的空闲任务统计，其他的内容忽略。
 
 ### `__dequeue_entity`函数
 
@@ -201,7 +201,7 @@ static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 }
 ```
 
-这个函数将`se`从cfs_rq之中移除，这意味这将任务从cfs_rq之中移除，这个函数的逻辑正好与`__enqueue_entity`函数相反。
+这个函数将`se`从CFS运行队列之中移除，这意味这将任务从CFS运行队列之中移除，这个函数的逻辑正好与`__enqueue_entity`函数相反。
 
 ### `sub_nr_running`函数
 
@@ -218,4 +218,4 @@ static inline void sub_nr_running(struct rq *rq, unsigned count)
 }
 ```
 
-这个函数修改rq之中可运行任务的数量，从中减去`count`的值，其他的内容忽略。
+这个函数修改运行队列之中可运行任务的数量，从中减去`count`的值，其他的内容忽略。
