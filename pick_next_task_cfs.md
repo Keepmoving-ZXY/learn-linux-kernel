@@ -328,7 +328,7 @@ out:
 
 这部分对应代码中`raw_spin_rq_unlock`与`raw_spin_rq_lock`这两个函数调用位置之间的代码，这两个函数用于释放、获取运行队列之中的锁：这个过程中不需要对运行队列自身进行修改，所以先释放在`__schedule`函数间接调用此函数之前获取到的运行队列之中的锁；尝试从调度域其他cpu中拉取任务过程结束之后需要重新获取运行队列之中的锁，一方面是因为接下来要对运行队列进行修改、另外一方面是保持`__schedule`间接调用此函数时锁的一致性。
 
-设置`t0`为尝试从调度域其他cpu中拉取任务的开始时间，调用`update_blocked_averages`函数更新运行队列之中平均负载统计，这个函数名之中`blocked`含义为`blocked load`，结合`update_tg_cfs_util`之前的注释认为`blocked load`为运行队列之中任务的历史权重，在计算平均负载的时候会考虑任务的历史权重。从调度域其他cpu之中拉取任务对应的代码在`for_each_domain`这个循环之中，这个循环遍历当前cpu所在的调度域，对于每个调度域调用`update_next_balance`函数更新此调度域下次执行负载均衡的时间、调用`load_balance`函数尝试从调度域中其他cpu拉取一个任务、调用`update_newidle_cost`更新调度域负载均衡消耗的时间，若已经拉取到任务或者运行队列中已经有可运行的任务或者运行队列中有等待运行的任务直接退出调度域遍历过程。在循环过程中还会记录对正在遍历的调度域中调用`load_balance`函数进行负载均衡的时间，更新正在遍历的调度域的负载均衡所需时间，还会判断运行队列处于空闲状态时间(`avg_idle`)与尝试从其他cpu中拉取任务累计消耗时间(`curr_cost`)、负载均衡操作消耗的最长时间(`max_newidle_lb_cost`)，若前者小于后者则认为从其他的cpu中拉取任务是低效的、直接放弃未遍历到的调度域。
+设置`t0`为尝试从调度域其他cpu中拉取任务的开始时间，调用`update_blocked_averages`函数更新运行队列之中平均负载统计，这个函数名之中`blocked`含义为`blocked load`，这个概念的含义见[Per-entity load tracking](https://lwn.net/Articles/531853/)，简而言之内核用`blocked load`来单独保存被阻塞任务的平均负载等统计指标。从调度域其他cpu之中拉取任务对应的代码在`for_each_domain`这个循环之中，这个循环遍历当前cpu所在的调度域，对于每个调度域调用`update_next_balance`函数更新此调度域下次执行负载均衡的时间、调用`load_balance`函数尝试从调度域中其他cpu拉取一个任务、调用`update_newidle_cost`更新调度域负载均衡消耗的时间，若已经拉取到任务或者运行队列中已经有可运行的任务或者运行队列中有等待运行的任务直接退出调度域遍历过程。在循环过程中还会记录对正在遍历的调度域中调用`load_balance`函数进行负载均衡的时间，更新正在遍历的调度域的负载均衡所需时间，还会判断运行队列处于空闲状态时间(`avg_idle`)与尝试从其他cpu中拉取任务累计消耗时间(`curr_cost`)、负载均衡操作消耗的最长时间(`max_newidle_lb_cost`)，若前者小于后者则认为从其他的cpu中拉取任务是低效的、直接放弃未遍历到的调度域。
 
 在后边详细记录上述流程中提到的`update_blocked_averages`、`update_newidle_cost`、`update_next_balance`函数，`load_balance`内容十分复杂需要在一个文档之中单独记录流程，其他的函数忽略。
 
@@ -339,6 +339,91 @@ out:
 #### 标签`out`
 
 若当前的运行队列设置的下次负载均衡运行(`this_rq->max_idle_balance_cost`)时间晚于负载均衡过程中计算出来的时间(`next_balance`)，则提前当前运行队列下次负载均衡运行时间至负载均衡过程中计算出来的时间。若已经拉取到任务或者当前运行队列之中有优先级更高的任务，运行队列即将退出空闲状态，重置`idle_stamp`为0；若没有拉取到任务则调用`nohz_newidle_balance`函数进行负载均衡相关的检查工作。在后边详细记录`nohz_newidle_balance`函数流程，其他的函数忽略。
+
+### `update_blocked_averages`函数
+
+```c
+static void update_blocked_averages(int cpu)
+{
+	bool decayed = false, done = true;
+	struct rq *rq = cpu_rq(cpu);
+	struct rq_flags rf;
+
+	rq_lock_irqsave(rq, &rf);
+	update_blocked_load_tick(rq);
+	update_rq_clock(rq);
+
+	decayed |= __update_blocked_others(rq, &done);
+	decayed |= __update_blocked_fair(rq, &done);
+
+	update_blocked_load_status(rq, !done);
+	if (decayed)
+		cpufreq_update_util(rq, 0);
+	rq_unlock_irqrestore(rq, &rf);
+}
+```
+
+这个函数在持有运行队列锁并且禁用软中断的前提下进行的，主要流程如下：
+
+1.调用`update_blocked_load_tick`函数更新运行队列`rq`中最近一次更新`blocked_load`的时间，`blocked_load`的含义见`newidle_balance`函数的详细流程说明；
+
+2.调用`update_rq_lock`更新运行队列`rq`的时间相关的字段，在后边的更新平均负载等统计字段的时候需要依赖这个函数执行的结果；
+
+3.调用`__udpate_blocked_others`函数更新运行队列`rq`中实时调度类、`deadline`调度类运行队列中被阻塞任务平均负载等指标，这个函数之中返回的`done`表示是否有阻塞的任务；
+
+4.调用`__update_blocked_fair`函数更新运行队列`rq`中CFS调度类的平均负载指标，这个函数之中返回的`done`表示是否有阻塞的任务；
+
+5.调用`update_blocked_load_status`函数更新运行队列`rq`之中是否有阻塞任务的标记，需要依赖`done`的值；
+
+上述流程中涉及到好几个函数，其中`__update_blocked_fair`、`__update_blocked_others`函数的流程在后边详细记录，`update_rq_lock`函数流程详细记录见`task_wake_up.md`，其他的内容忽略。
+
+### `__update_blocked_others`函数
+
+```c
+static bool __update_blocked_others(struct rq *rq, bool *done)
+{
+	const struct sched_class *curr_class;
+	u64 now = rq_clock_pelt(rq);
+	unsigned long thermal_pressure;
+	bool decayed;
+
+	/*
+	 * update_load_avg() can call cpufreq_update_util(). Make sure that RT,
+	 * DL and IRQ signals have been updated before updating CFS.
+	 */
+	curr_class = rq->curr->sched_class;
+
+	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
+
+	decayed = update_rt_rq_load_avg(now, rq, curr_class == &rt_sched_class) |
+		  update_dl_rq_load_avg(now, rq, curr_class == &dl_sched_class) |
+		  update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure) |
+		  update_irq_load_avg(rq, 0);
+
+	if (others_have_blocked(rq))
+		*done = false;
+
+	return decayed;
+}
+```
+
+`rq_clock_pelt`函数给出现在的时间(移除了运行队列处于空闲的时间)保存在`now`之中，`curr_class`为运行队列`rq`中正在运行的任务关联的调度类，`update_rt_rq_load_avg`更新实时调度类对应运行队列的平均负载等统计指标，`update_dl_rq_load_avg`更新`deadline`调度类对应运行队列的平均负载统计等指标，调用这两个函数的时候第三个参数为是否有关联此调度类的任务正在运行。`others_have_blocked`函数给出运行队列`rq`中这两个调度类的队列之中是否有阻塞的任务，如果有阻塞的任务通过`done`标记此种情况。接下来记录这个函数中调用的`rq_clock_pelt`、`update_rt_rq_load_avg`、`update_dl_rq_load_avg`函数的详细流程，其他的内容忽略。
+
+### `rq_clock_pelt`函数
+
+```c
+static inline u64 rq_clock_pelt(struct rq *rq)
+{
+	lockdep_assert_rq_held(rq);
+	assert_clock_updated(rq);
+
+	return rq->clock_pelt - rq->lost_idle_time;
+}
+
+
+```
+
+`clock_pelt`为计算任务负载专用的当前时间，这个时间的计算见`task_wake_up.md`之中记录的的`update_rq_clock_pelt`函数，`lost_idle_time`为累计的空闲时间，这个函数返回二者的差值用于平均负载的计算。
 
 ### `update_next_balance`函数
 
@@ -387,4 +472,4 @@ get_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
 }
 ```
 
-这个函数基于调度域默认的负载均衡时间间隔(`balance_interval`)，结合当前cpu是否处于忙碌状态，计算出一个负载均衡时间间隔。若当前cpu处于忙碌状态，将调度域默认的负载均衡时间间隔放大，减少负载均衡的运行次数。在当前cpu处于忙碌状态的时候，为了防止不同层次的调度域执行负载均衡的时间成为倍数关系造成的不同层次调度域连续运行负载均衡操作，递减调度域`sd`的时间间隔。最后为调度域`sd`运行负载均衡的时间间隔加一个上限、下限限制作为最终的结果并返回。
+这个函数基于调度域默认的负载均衡时间间隔(`balance_interval`)，结合当前cpu是否处于忙碌状态，计算出一个负载均衡时间间隔。若当前cpu处于忙碌状态，将调度域默认的负载均衡时间间隔放大，减少负载均衡的运行次数。在当前cpu处于忙碌状态的时候，为了防止不同层次的调度域执行负载均衡的时间成为倍数关系造成的不同层次调度域连续运行负载均衡操作，递减调度域`sd`的时间间隔。最后为调度域`sd`运行负载均衡的时间间隔加一个上限、下限限制为最终的结果并返回。
