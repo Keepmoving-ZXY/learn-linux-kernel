@@ -365,15 +365,15 @@ static void update_blocked_averages(int cpu)
 
 这个函数在持有运行队列锁并且禁用软中断的前提下进行的，主要流程如下：
 
-1.调用`update_blocked_load_tick`函数更新运行队列`rq`中最近一次更新`blocked_load`的时间，`blocked_load`的含义见`newidle_balance`函数的详细流程说明；
+1).调用`update_blocked_load_tick`函数更新运行队列`rq`中最近一次更新`blocked_load`的时间，`blocked_load`的含义见`newidle_balance`函数的详细流程说明；
 
-2.调用`update_rq_lock`更新运行队列`rq`的时间相关的字段，在后边的更新平均负载等统计字段的时候需要依赖这个函数执行的结果；
+2).调用`update_rq_lock`更新运行队列`rq`的时间相关的字段，在后边的更新平均负载等统计字段的时候需要依赖这个函数执行的结果；
 
-3.调用`__udpate_blocked_others`函数更新运行队列`rq`中实时调度类、`deadline`调度类运行队列中被阻塞任务平均负载等指标，这个函数之中返回的`done`表示是否有阻塞的任务；
+3).调用`__udpate_blocked_others`函数更新运行队列`rq`中实时调度类、`deadline`调度类运行队列中被阻塞任务平均负载等指标，这个函数之中返回的`done`表示是否有阻塞的任务；
 
-4.调用`__update_blocked_fair`函数更新运行队列`rq`中CFS调度类的平均负载指标，这个函数之中返回的`done`表示是否有阻塞的任务；
+4).调用`__update_blocked_fair`函数更新运行队列`rq`中CFS调度类的平均负载指标，这个函数之中返回的`done`表示是否有阻塞的任务；
 
-5.调用`update_blocked_load_status`函数更新运行队列`rq`之中是否有阻塞任务的标记，需要依赖`done`的值；
+5).调用`update_blocked_load_status`函数更新运行队列`rq`之中是否有阻塞任务的标记，需要依赖`done`的值；
 
 上述流程中涉及到好几个函数，其中`__update_blocked_fair`、`__update_blocked_others`函数的流程在后边详细记录，`update_rq_lock`函数流程详细记录见`task_wake_up.md`，其他的内容忽略。
 
@@ -407,7 +407,7 @@ static bool __update_blocked_others(struct rq *rq, bool *done)
 }
 ```
 
-`rq_clock_pelt`函数给出现在的时间(移除了运行队列处于空闲的时间)保存在`now`之中，`curr_class`为运行队列`rq`中正在运行的任务关联的调度类，`update_rt_rq_load_avg`更新实时调度类对应运行队列的平均负载等统计指标，`update_dl_rq_load_avg`更新`deadline`调度类对应运行队列的平均负载统计等指标，调用这两个函数的时候第三个参数为是否有关联此调度类的任务正在运行。`others_have_blocked`函数给出运行队列`rq`中这两个调度类的队列之中是否有阻塞的任务，如果有阻塞的任务通过`done`标记此种情况。接下来记录这个函数中调用的`rq_clock_pelt`、`update_rt_rq_load_avg`、`update_dl_rq_load_avg`函数的详细流程，其他的内容忽略。
+`rq_clock_pelt`函数给出现在的时间(移除了运行队列处于空闲的时间)保存在`now`之中，`curr_class`为运行队列`rq`中正在运行的任务关联的调度类，`update_rt_rq_load_avg`更新实时调度类对应运行队列的平均负载等统计指标，`update_dl_rq_load_avg`更新`deadline`调度类对应运行队列的平均负载统计等指标，调用这两个函数的时候第三个参数为是否有关联此调度类的任务正在运行。`others_have_blocked`函数给出运行队列`rq`中这两个调度类的队列之中是否有阻塞的任务，如果有阻塞的任务通过`done`标记此种情况。接下来记录这个函数中调用的`rq_clock_pelt`、`update_rt_rq_load_avg`、`update_dl_rq_load_avg`、`others_have_blocked`函数的详细流程，其他的内容忽略。
 
 ### `rq_clock_pelt`函数
 
@@ -424,6 +424,111 @@ static inline u64 rq_clock_pelt(struct rq *rq)
 ```
 
 `clock_pelt`为计算任务负载专用的当前时间，这个时间的计算见`task_wake_up.md`之中记录的的`update_rq_clock_pelt`函数，`lost_idle_time`为累计的空闲时间，这个函数返回二者的差值用于平均负载的计算。
+
+### `update_rt_rq_load_avg`函数
+
+```c
+int update_rt_rq_load_avg(u64 now, struct rq *rq, int running)
+{
+	if (___update_load_sum(now, &rq->avg_rt,
+				running,
+				running,
+				running)) {
+
+		___update_load_avg(&rq->avg_rt, 1);
+		trace_pelt_rt_tp(rq);
+		return 1;
+	}
+
+	return 0;
+}
+```
+
+忽略`trace_pelt_rt_tp`函数的内容，这个函数更新实时调度类运行队列的平均负载等统计指标，`running`为运行队列之中正在执行的任务是否关联了试试调度类，计算过程调用的`___upate_load_sum`、`___update_load_avg`两个函数流程在`enqueue_task_cfs.md`之中有详细记录，需要住的是当`running`为0时`___update_load_sum`函数仅仅对之前的`util_sum`、`load_sum`、`runnable_sum`指标进行衰减而不考虑最近的运行时间，这三个`sum`指标变化之后需要更新对应的`avg`指标。
+
+### `update_dl_rq_load_avg`函数
+
+```c
+int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
+{
+	if (___update_load_sum(now, &rq->avg_dl,
+				running,
+				running,
+				running)) {
+
+		___update_load_avg(&rq->avg_dl, 1);
+		trace_pelt_dl_tp(rq);
+		return 1;
+	}
+
+	return 0;
+}
+```
+
+这个函数的逻辑与`update_rt_rq_load_avg`函数一致，只不过这个函数更新的是`deadline`调度类的统计指标。
+
+### `__update_blocked_fair`函数
+
+```c
+static bool __update_blocked_fair(struct rq *rq, bool *done)
+{
+	struct cfs_rq *cfs_rq, *pos;
+	bool decayed = false;
+	int cpu = cpu_of(rq);
+
+	/*
+	 * Iterates the task_group tree in a bottom up fashion, see
+	 * list_add_leaf_cfs_rq() for details.
+	 */
+	for_each_leaf_cfs_rq_safe(rq, cfs_rq, pos) {
+		struct sched_entity *se;
+
+		if (update_cfs_rq_load_avg(cfs_rq_clock_pelt(cfs_rq), cfs_rq)) {
+			update_tg_load_avg(cfs_rq);
+
+			if (cfs_rq->nr_running == 0)
+				update_idle_cfs_rq_clock_pelt(cfs_rq);
+
+			if (cfs_rq == &rq->cfs)
+				decayed = true;
+		}
+
+		/* Propagate pending load changes to the parent, if any: */
+		se = cfs_rq->tg->se[cpu];
+		if (se && !skip_blocked_update(se))
+			update_load_avg(cfs_rq_of(se), se, UPDATE_TG);
+
+		/*
+		 * There can be a lot of idle CPU cgroups.  Don't let fully
+		 * decayed cfs_rqs linger on the list.
+		 */
+		if (cfs_rq_is_decayed(cfs_rq))
+			list_del_leaf_cfs_rq(cfs_rq);
+
+		/* Don't need periodic decay once load/util_avg are null */
+		if (cfs_rq_has_blocked(cfs_rq))
+			*done = false;
+	}
+
+	return decayed;
+}
+```
+
+这个函数更新运行队列`rq`之中的所有`leaf cfs_rq`的平均负载等统计指标，`leaf cfs_rq`的含义在`enqueue_task_cfs.md`文件中的`list_add_leaf_cfs_rq`函数流程记录之中可以找到，通过`leaf cfs_rq`可以找到运行在当前cpu上的所有包含任务的CFS运行队列。使用`for_each_leaf_cfs_rq_safe`来遍历运行队列`rq`之中每个`leaf cfs_rq`，对于遍历到的每个CFS运行队列执行：
+
+1).更新CFS运行队列的平均负载等统计指标，更新过程在`update_cfs_rq_load_avg`函数中实现，这个函数的详细流程记录见`enqueue_task_cfs.md`；
+
+2).若更新CFS运行队列平均负载等统计指标的过程中运行过指数衰减计算：
+
+2.1).`cfs_rq`为任务组在当前cpu上的CFS运行队列，将`cfs_rq`中平均负载等统计指标传播到任务组之中，更新过程在`update_tg_load_avg`函数中实现，这个函数的详细流程记录见`enqueue_task_cfs.md`；
+
+2.2).若`cfs_rq`为当前运行队列`rq`中的CFS运行队列，将`delay`设置为`true`标记运行队列出现过指数衰减计算；
+
+3).任务组的平均负载等统计指标已经更新，需要向调度层级中的上级传递统计指标的变化，代码之中`se`之中保存了最新的指标值、`cfs_rq_of(se)`为`se`的上级，调用`update_load_avg`函数将`se`之中保存的统计指标传播到上级之中，这个函数详细流程记录见`enqueue_task_cfs.md`；
+
+4).若CFS运行队列`cfs_rq`之中没有可运行的任务，从`leaf cfs_rq`之中将此CFS运行队列移除，`cfs_rq_is_decayed`函数用于判断是否CFS运行队列之中是否有可运行的任务、`list_del_leaf_cfs_rq`将`cfs_rq`从`leaf cfs_rq`之中移除，这两个函数的内容忽略；
+
+5).若`cfs_rq`之中依然还有阻塞的任务，通过`done`通过调用者这个情况，这个判断是在`cfs_rq_has_blocked`函数之中完成的，这个函数通过判断`load_avg`、`util_avg`两个指标是否为0来确定是否有阻塞的任务。考虑到这个函数是在未找到接下来运行的任务时调用的，这两个指标为0时意味着CFS运行队列中没有可运行任务，若这两个指标不为0则意味着CFS运行队列中有被阻塞的任务。
 
 ### `update_next_balance`函数
 

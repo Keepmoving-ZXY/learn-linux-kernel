@@ -1288,7 +1288,7 @@ static inline bool list_add_leaf_cfs_rq(struct cfs_rq *cfs_rq)
 }
 ```
 
-`leaf cfs_rq`指的是调度层次之中一类特殊的CFS运行队列，这类CFS运行队列之中保存的实体对应的是任务，这个函数将一个cpu之中的`leaf cfs_rq`都放到一个cpu的运行队列之中的列表之中，若之后记录`CFS`的其他函数使用到这个列表，在详细记录这个列表的作用以及相关机制，这里仅仅记录这个函数的流程。
+`leaf cfs_rq`指的是调度层次之中一类特殊的CFS运行队列，这类CFS运行队列之中保存的实体对应的是任务，这个函数将一个cpu之中的`leaf cfs_rq`都放到一个cpu的运行队列之中的列表之中，若之后记录`CFS`的其他函数使用到这个列表，再详细记录这个列表的作用以及相关机制，这里仅仅记录这个函数的流程。
 
 `rq`为CFS运行队列所在cpu的任务队列，这个队列是Linux内核之中调度框架之中的任务队列，不是CFS调度类使用的任务队列，`rq`中的`leaf_cfs_rq_list`就是保存`leaf cfs_rq`队列的头节点。结合注释可以看到，`tmp_alone_branch`主要是在指向新的`cfs_rq`插入`rq`的`leaf_cfs_rq_list`时的位置，在一些情况之中需要借助它进行判断：若`cfs_rq`已经在队列之中则返回调度层级中的父队列是否已经在`rq`的`leaf_cfs_rq_list`之中；若这个`cfs_rq`有父队列并且父队列已经在`rq`的`leaf_cfs_rq_list`之中，直接将`cfs_rq`加入到父队列之中`leaf_cfs_rq_list`的队尾，并且将`rq`的`tmp_alone_branch`指向`rq`的`leaf_cfs_rq_list`表示父队列已经在`rq`的`leaf_cfs_rq_list`之中；若父队列不存在，这意味着`cfs_rq`位于调度层级之中最顶层，则先将`cfs_rq`加入到`rq`的`leaf_cfs_rq_list`之中；若父队列还没有放到`rq`的`leaf_cfs_rq_list`之中，则将`cfs_rq`加入到`tmp_alone_branch`指向的列表之中位置之后并且让`tmp_alone_branch`指向新加入的`cfs_rq`，这样当`cfs_rq`的父队列需要入队的时候可以快速找到自己所在的位置。
 
