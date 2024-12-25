@@ -165,7 +165,7 @@ idle:
 
 #### 选择一个任务
 
-这部分的内容对应代码之中`do { ... } while (cfs_rq)`这个循环，这个循环在调度层级中的任务组之中寻找一个可运行的任务。循环中`curr`为CFS运行队列`cfs_rq`中正在运行的任务，如果这个任务依然在`rq`之中(`on_rq`不为0)则意味着此时没有调用`put_prev_entity`，调用`update_curr`函数更新正在运行任务的运行时间统计，其他情况下设置`curr`为空。接下来调用`pick_next_entity`函数从`cfs_rq`之中选择一个可运行的实体，如果实体对应的是一个任务组则`cfs_rq`为任务组在当前cpu上的运行队列，这种情况下会继续进行循环；如果实体对应的是一个任务则不再继续执行循环，开始执行后边的流程。这里提到的`update_curr`函数详细记录见`task_fork_cfs.md`，`put_prev_entity`函数详细记录见`put_set_task_cfs.md`文件，在后边详细记录`pick_next_task`函数流程，其他的内容忽略。
+这部分的内容对应代码之中`do { ... } while (cfs_rq)`这个循环，这个循环在调度层级中的任务组之中寻找一个可运行的任务。循环中`curr`为CFS运行队列`cfs_rq`中正在运行的任务，如果这个任务依然在`rq`之中(`on_rq`不为0)则意味着此时没有调用`put_prev_entity`，调用`update_curr`函数更新正在运行任务的运行时间统计，其他情况下设置`curr`为空。接下来调用`pick_next_entity`函数从`cfs_rq`之中选择一个可运行的实体，如果实体对应的是一个任务组则`cfs_rq`为任务组在当前cpu上的运行队列，这种情况下会继续进行循环；如果实体对应的是一个任务则不再继续执行循环，开始执行后边的流程。这里提到的`update_curr`函数详细记录见`task_fork_cfs.md`，`put_prev_entity`函数详细记录见`put_set_task_cfs.md`文件，在后边详细记录`pick_next_entity`函数流程，其他的内容忽略。
 
 #### 不同的调度层级
 
@@ -182,6 +182,68 @@ idle:
 #### 标签`idle`
 
 这部分的内容对应代码之中`idle`处的代码，这些代码在运行队列`rq`不为空的前提下执行。调用`newidle_balance`函数进行cpu之间任务的负载均衡，尝试从其他的cpu之中拉去可运行的任务到当前的cpu之中，若返回`-1`意味着没有找到关联CFS调度类的任务，返回-1；若返回值大于0则意味着拉去到了新的任务，代码跳转到标签`again`处即函数开始的位置继续执行；若返回值等于0意味着没有找到可以运行的任务，则调用`update_idle_rq_clock_pelt`函数更新空闲运行队列的相关统计并返回0。在后边记录这里提到的`newidle_balance`、`update_idle_rq_clock_pelt`两个函数流程，其他的内容忽略。
+
+### `pick_next_entity`函数
+
+```c
+/*
+ * Pick the next process, keeping these things in mind, in this order:
+ * 1) keep things fair between processes/task groups
+ * 2) pick the "next" process, since someone really wants that to run
+ * 3) pick the "last" process, for cache locality
+ * 4) do not run the "skip" process, if something else is available
+ */
+static struct sched_entity *
+pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+{
+	struct sched_entity *left = __pick_first_entity(cfs_rq);
+	struct sched_entity *se;
+
+	/*
+	 * If curr is set we have to see if its left of the leftmost entity
+	 * still in the tree, provided there was anything in the tree at all.
+	 */
+	if (!left || (curr && entity_before(curr, left)))
+		left = curr;
+
+	se = left; /* ideally we run the leftmost entity */
+
+	/*
+	 * Avoid running the skip buddy, if running something else can
+	 * be done without getting too unfair.
+	 */
+	if (cfs_rq->skip && cfs_rq->skip == se) {
+		struct sched_entity *second;
+
+		if (se == curr) {
+			second = __pick_first_entity(cfs_rq);
+		} else {
+			second = __pick_next_entity(se);
+			if (!second || (curr && entity_before(curr, second)))
+				second = curr;
+		}
+
+		if (second && wakeup_preempt_entity(second, left) < 1)
+			se = second;
+	}
+
+	if (cfs_rq->next && wakeup_preempt_entity(cfs_rq->next, left) < 1) {
+		/*
+		 * Someone really wants this to run. If it's not unfair, run it.
+		 */
+		se = cfs_rq->next;
+	} else if (cfs_rq->last && wakeup_preempt_entity(cfs_rq->last, left) < 1) {
+		/*
+		 * Prefer last buddy, try to return the CPU to a preempted task.
+		 */
+		se = cfs_rq->last;
+	}
+
+	return se;
+}
+```
+
+
 
 ### `newidle_balance`函数
 
@@ -328,7 +390,7 @@ out:
 
 这部分对应代码中`raw_spin_rq_unlock`与`raw_spin_rq_lock`这两个函数调用位置之间的代码，这两个函数用于释放、获取运行队列之中的锁：这个过程中不需要对运行队列自身进行修改，所以先释放在`__schedule`函数间接调用此函数之前获取到的运行队列之中的锁；尝试从调度域其他cpu中拉取任务过程结束之后需要重新获取运行队列之中的锁，一方面是因为接下来要对运行队列进行修改、另外一方面是保持`__schedule`间接调用此函数时锁的一致性。
 
-设置`t0`为尝试从调度域其他cpu中拉取任务的开始时间，调用`update_blocked_averages`函数更新运行队列之中平均负载统计，这个函数名之中`blocked`含义为`blocked load`，这个概念的含义见[Per-entity load tracking](https://lwn.net/Articles/531853/)，简而言之内核用`blocked load`来单独保存被阻塞任务的平均负载等统计指标。从调度域其他cpu之中拉取任务对应的代码在`for_each_domain`这个循环之中，这个循环遍历当前cpu所在的调度域，对于每个调度域调用`update_next_balance`函数更新此调度域下次执行负载均衡的时间、调用`load_balance`函数尝试从调度域中其他cpu拉取一个任务、调用`update_newidle_cost`更新调度域负载均衡消耗的时间，若已经拉取到任务或者运行队列中已经有可运行的任务或者运行队列中有等待运行的任务直接退出调度域遍历过程。在循环过程中还会记录对正在遍历的调度域中调用`load_balance`函数进行负载均衡的时间，更新正在遍历的调度域的负载均衡所需时间，还会判断运行队列处于空闲状态时间(`avg_idle`)与尝试从其他cpu中拉取任务累计消耗时间(`curr_cost`)、负载均衡操作消耗的最长时间(`max_newidle_lb_cost`)，若前者小于后者则认为从其他的cpu中拉取任务是低效的、直接放弃未遍历到的调度域。
+设置`t0`为尝试从调度域其他cpu中拉取任务的开始时间，调用`update_blocked_averages`函数更新运行队列之中平均负载统计，这个函数名之中`blocked`含义为`blocked load`，这个概念的含义见[Per-entity load tracking](https://lwn.net/Articles/531853/)，简而言之内核用`blocked load`指的是那些被阻塞任务的负载。从调度域其他cpu之中拉取任务对应的代码在`for_each_domain`这个循环之中，这个循环遍历当前cpu所在的调度域，对于每个调度域调用`update_next_balance`函数更新此调度域下次执行负载均衡的时间、调用`load_balance`函数尝试从调度域中其他cpu拉取一个任务、调用`update_newidle_cost`更新调度域负载均衡消耗的时间，若已经拉取到任务或者运行队列中已经有可运行的任务或者运行队列中有等待运行的任务直接退出调度域遍历过程。在循环过程中还会记录对正在遍历的调度域中调用`load_balance`函数进行负载均衡的时间，更新正在遍历的调度域的负载均衡所需时间，还会判断运行队列处于空闲状态时间(`avg_idle`)与尝试从其他cpu中拉取任务累计消耗时间(`curr_cost`)、负载均衡操作消耗的最长时间(`max_newidle_lb_cost`)，若前者小于后者则认为从其他的cpu中拉取任务是低效的、直接放弃未遍历到的调度域。
 
 在后边详细记录上述流程中提到的`update_blocked_averages`、`update_newidle_cost`、`update_next_balance`函数，`load_balance`内容十分复杂需要在一个文档之中单独记录流程，其他的函数忽略。
 
@@ -530,6 +592,36 @@ static bool __update_blocked_fair(struct rq *rq, bool *done)
 
 5).若`cfs_rq`之中依然还有阻塞的任务，通过`done`通过调用者这个情况，这个判断是在`cfs_rq_has_blocked`函数之中完成的，这个函数通过判断`load_avg`、`util_avg`两个指标是否为0来确定是否有阻塞的任务。考虑到这个函数是在未找到接下来运行的任务时调用的，这两个指标为0时意味着CFS运行队列中没有可运行任务，若这两个指标不为0则意味着CFS运行队列中有被阻塞的任务。
 
+### `update_newidle_cost`函数
+
+```c
+static inline bool update_newidle_cost(struct sched_domain *sd, u64 cost)
+{
+	if (cost > sd->max_newidle_lb_cost) {
+		/*
+		 * Track max cost of a domain to make sure to not delay the
+		 * next wakeup on the CPU.
+		 */
+		sd->max_newidle_lb_cost = cost;
+		sd->last_decay_max_lb_cost = jiffies;
+	} else if (time_after(jiffies, sd->last_decay_max_lb_cost + HZ)) {
+		/*
+		 * Decay the newidle max times by ~1% per second to ensure that
+		 * it is not outdated and the current max cost is actually
+		 * shorter.
+		 */
+		sd->max_newidle_lb_cost = (sd->max_newidle_lb_cost * 253) / 256;
+		sd->last_decay_max_lb_cost = jiffies;
+
+		return true;
+	}
+
+	return false;
+}
+```
+
+这个函数更新调度域`sd`在运行队列空闲时运行负载均衡消耗的最长时间，要考虑本次运行负载均衡消耗的时间和`sd`之中保存的最长时间相对大小：若前者大于后者直接将`sd`之中保存的历史最长时间更新为前者；若前者小于后者并且现在与上次衰减时间差距超过1s，则将调度域`sd`的最长时间衰减1%，防止因为最长时间过大抑制负载均衡的执行。
+
 ### `update_next_balance`函数
 
 ```c
@@ -578,3 +670,91 @@ get_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
 ```
 
 这个函数基于调度域默认的负载均衡时间间隔(`balance_interval`)，结合当前cpu是否处于忙碌状态，计算出一个负载均衡时间间隔。若当前cpu处于忙碌状态，将调度域默认的负载均衡时间间隔放大，减少负载均衡的运行次数。在当前cpu处于忙碌状态的时候，为了防止不同层次的调度域执行负载均衡的时间成为倍数关系造成的不同层次调度域连续运行负载均衡操作，递减调度域`sd`的时间间隔。最后为调度域`sd`运行负载均衡的时间间隔加一个上限、下限限制为最终的结果并返回。
+
+### `nohz_newidle_balance`函数
+
+```c
+static void nohz_newidle_balance(struct rq *this_rq)
+{
+	int this_cpu = this_rq->cpu;
+
+	/*
+	 * This CPU doesn't want to be disturbed by scheduler
+	 * housekeeping
+	 */
+	if (!housekeeping_cpu(this_cpu, HK_TYPE_SCHED))
+		return;
+
+	/* Will wake up very soon. No time for doing anything else*/
+	if (this_rq->avg_idle < sysctl_sched_migration_cost)
+		return;
+
+	/* Don't need to update blocked load of idle CPUs*/
+	if (!READ_ONCE(nohz.has_blocked) ||
+	    time_before(jiffies, READ_ONCE(nohz.next_blocked)))
+		return;
+
+	/*
+	 * Set the need to trigger ILB in order to update blocked load
+	 * before entering idle state.
+	 */
+	atomic_or(NOHZ_NEWILB_KICK, nohz_flags(this_cpu));
+}
+```
+
+这个函数为当前的cpu设置`NOHZ_NEWILB_KICK`标志，这个标志的含义是当cpu进入到空闲状态时更新运行队列之中`blocked_load`，`blocked load`的含义见`newidle_balance`函数详细流程记录。不是所有的情况都需要都需要设置这个标记，当运行队列`this_rq`空闲的时间过短以至于小于任务从其他cpu之中迁移过来的时间、现在的时间小于下一次`blocked load`更新的时间时，不需要添加这个标记。第一种情况可以理解为现在当前cpu的空闲时间还很短，可能很快就会有任务从其他的cpu之中迁移过来，如果有任务迁移过来了当前cpu没有时间进行其他的计算了，所以需要继续等。
+
+### `update_idle_rq_clock_pelt`函数
+
+```c
+/*
+ * When rq becomes idle, we have to check if it has lost idle time
+ * because it was fully busy. A rq is fully used when the /Sum util_sum
+ * is greater or equal to:
+ * (LOAD_AVG_MAX - 1024 + rq->cfs.avg.period_contrib) << SCHED_CAPACITY_SHIFT;
+ * For optimization and computing rounding purpose, we don't take into account
+ * the position in the current window (period_contrib) and we use the higher
+ * bound of util_sum to decide.
+ */
+static inline void update_idle_rq_clock_pelt(struct rq *rq)
+{
+	u32 divider = ((LOAD_AVG_MAX - 1024) << SCHED_CAPACITY_SHIFT) - LOAD_AVG_MAX;
+	u32 util_sum = rq->cfs.avg.util_sum;
+	util_sum += rq->avg_rt.util_sum;
+	util_sum += rq->avg_dl.util_sum;
+
+	/*
+	 * Reflecting stolen time makes sense only if the idle
+	 * phase would be present at max capacity. As soon as the
+	 * utilization of a rq has reached the maximum value, it is
+	 * considered as an always running rq without idle time to
+	 * steal. This potential idle time is considered as lost in
+	 * this case. We keep track of this lost idle time compare to
+	 * rq's clock_task.
+	 */
+	if (util_sum >= divider)
+		rq->lost_idle_time += rq_clock_task(rq) - rq->clock_pelt;
+
+	_update_idle_rq_clock_pelt(rq);
+}
+```
+
+这个函数中`divider`为`util_sum`的几何级数之和的极限值，`util_sum`为运行队列`rq`之中正在运行任务的几何级数之和，若`util_sum`大于其理论上的最大值则意味着运行队列`rq`在超负荷运行，这就意味着理论上应该有一段时间运行队列`rq`应该处于空闲状态，`struct rq`之中的`lost_idle_time`字段保存理论上应该处于空闲状态但实际上却没有的时间累计值。这个时间由`rq`之中的当前时间与`PELT`统计计算使用的当前时间(`clock_pelt`)之差得到，`PELT`统计计算使用的当前时间不包含运行队列处于空闲状态的时间，所以把二者的差值当作`lost_idle_time`的累加值。`_update_idle_rq_clock_pelt`函数更新`rq`之中其他的时间字段，接下来详细记录这个函数的流程。
+
+### `_update_idle_rq_clock_pelt`函数
+
+```c
+/* The rq is idle, we can sync to clock_task */
+static inline void _update_idle_rq_clock_pelt(struct rq *rq)
+{
+	rq->clock_pelt  = rq_clock_task(rq);
+
+	u64_u32_store(rq->clock_idle, rq_clock(rq));
+	/* Paired with smp_rmb in migrate_se_pelt_lag() */
+	smp_wmb();
+	u64_u32_store(rq->clock_pelt_idle, rq_clock_pelt(rq));
+}
+```
+
+这个函数将`PELT`统计计算使用的当前时间(`clock_pelt`)设置为运行队列之中的追踪任务时间使用的当前时间(`rq_clock_task(rq)`，这个时间忽略系统中断等占用的时间)、记录运行队列进入空闲状态的时间(`clock_idle`)、记录`PELT`统计计算使用的进入空闲状态的时间。
+
