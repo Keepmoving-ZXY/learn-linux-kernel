@@ -72,7 +72,7 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 }
 ```
 
-这个函数更新cfs_rq以及实体所在任务组的统计字段、确定正在执行的任务是否会被抢占，若确定任务会被抢占则为任务添加`TIF_NEED_RESCHED`标记。这个函数首先更新正在运行任务的时间统计、更新任务以及所在的cfs_rq的平均负载、更新任务组在某个cpu上实体的权重，`update_curr`函数的流程记录见`task_fork_cfs.md`、`update_load_avg`以及`update_cfs_group`两个函数的流程记录见`enqueue_task_fair.md`。接下来的内容涉及到周期性定时器与高精度定时器：若`queued`为1则表示此函数是从高精度定时器触发的`hrtick`函数之中调用，直接调用`resched_curr`设置任务抢占标记然后返回，可以直接进行抢占而不需要检查的原因是在设置高精度定时器时将触发时间设置为了rq中正在执行任务的时间片耗尽的时刻；若`queued`为0则表示此函数是从周期性的定时器触发的函数`scheduler_tick`之中调用的，此时若cfs_rq中有活跃的高精度定时器直接退出，原因会在`hrtick_update`函数之中提到；若cfs_rq没有活跃的高精度定时器，调用`check_preempt_tick`函数确定是否可以抢占当前正在运行的任务。上述流程中提到的`resched_curr`函数的详细流程在`task_wake_up.md`中记录，`hrtick`函数的详细流程在`schedule.md`文件中记录，`hrtick_start_fair`函数详细流程在`enqueue_task_fair.md`文件中记录，`check_preempt_tick`两个函数的详细流程在后边记录，其他的函数忽略。
+这个函数更新CFS运行队列以及实体所在任务组的统计字段、确定正在执行的任务是否会被抢占，若确定任务会被抢占则为任务添加`TIF_NEED_RESCHED`标记。这个函数首先更新正在运行任务的时间统计、更新任务以及所在的cfs_rq的平均负载、更新任务组在某个cpu上实体的权重，`update_curr`函数的流程记录见`task_fork_cfs.md`、`update_load_avg`以及`update_cfs_group`两个函数的流程记录见`enqueue_task_fair.md`。接下来的内容涉及到周期性定时器与高精度定时器：若`queued`为1则表示此函数是从高精度定时器触发的`hrtick`函数之中调用，直接调用`resched_curr`设置任务抢占标记然后返回，可以直接进行抢占而不需要检查的原因是在设置高精度定时器时将触发时间设置为了rq中正在执行任务的时间片耗尽的时刻；若`queued`为0则表示此函数是从周期性的定时器触发的函数`scheduler_tick`之中调用的，此时若CFS运行队列中有活跃的高精度定时器直接退出，原因会在`hrtick_update`函数之中提到；若CFS运行队列中没有活跃的高精度定时器，调用`check_preempt_tick`函数确定是否可以抢占当前正在运行的任务。上述流程中提到的`resched_curr`函数的详细流程在`task_wake_up.md`中记录，`hrtick`函数的详细流程在`schedule.md`文件中记录，`hrtick_start_fair`函数详细流程在`enqueue_task_fair.md`文件中记录，`check_preempt_tick`两个函数的详细流程在后边记录，其他的函数忽略。
 
 ### `check_preempt_tick`函数
 
@@ -118,6 +118,6 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 }
 ```
 
-这个函数确定cfs_rq之中正在运行的任务是否可以被抢占，这个函数调用`sched_slice`函数得到正在运行任务获得的时间片，`delta_exec`为任务时间片中已经消耗的时间，当已经消耗的时间大于这个任务的时间片意味着任务的时间片已经耗尽，调用`resched_curr`函数为这个任务设置抢占标志，随后函数退出。当任务的时间片还没有耗尽时，获取cfs_rq之中虚拟运行时间最小的任务，计算两个任务虚拟运行时间的差距，如果差距比正在运行任务的时间片还大则直接为正在运行任务设置抢占标记。`resched_curr`函数详细流程记录见`task_wake_up.md`，`sched_slice`函数详细流程记录见`task_fork_cfs.md`，`clear_buddies`函数直接忽略。
+这个函数确定CFS运行队列之中正在运行的任务是否可以被抢占，这个函数调用`sched_slice`函数得到正在运行任务获得的时间片，`delta_exec`为任务时间片中已经消耗的时间，当已经消耗的时间大于这个任务的时间片意味着任务的时间片已经耗尽，调用`resched_curr`函数为这个任务设置抢占标志，随后函数退出。当任务的时间片还没有耗尽时，获取cfs_rq之中虚拟运行时间最小的任务，计算两个任务虚拟运行时间的差距，如果差距比正在运行任务的时间片还大则直接为正在运行任务设置抢占标记。`resched_curr`函数详细流程记录见`task_wake_up.md`，`sched_slice`函数详细流程记录见`task_fork_cfs.md`，`clear_buddies`函数直接忽略。
 
 上述流程记录中忽略了任务已经消耗的时间与`sysctl_sched_min_granulrity`的比较，当前者小于后者时意味着任务运行时间比较短，此时不需要进行任何处理，这就意味着`sysctl_sched_min_granularity`为任务运行的最短运行时间。当前者大于后者的时候任务可能会被中断，这里正好对应了代码之中这个比较之前的注释内容。注释内容提到因为调度器的原因一个任务可能没有及时得到运行机会时，这个任务不需要等待一个完整的时间片才有机会继续执行，可以理解代码理解这些注释：代码之中判断只要任务的运行时间大于`sysctl_sched_min_granularity`时继续执行后续的流程，在后续的流程中会存在为此任务设置抢占标记，这个时候之前未得到运行机会的任务就有可能抢占正在运行的任务。

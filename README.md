@@ -13,3 +13,5 @@
 6.`dequeue_task_cfs.md`中的内容是`dequeue_task_fair`函数的流程记录，这个函数是内核调度机制中`dequeue_task`方法的CFS实现；
 
 7.`task_tick_cfs.md`中的内容是`task_tick_fair`函数的流程记录，这个函数是内核调度机制中`task_tick_fair`方法的CFS实现；
+
+8.`pick_next_task_cfs.md`中的内容是`__pick_next_task_fair`函数的流程记录，这个函数是内核调度机制中`pick_next_task`方法的CFS实现；
