@@ -1,12 +1,12 @@
 ## 简介
 
-在linux任务调度过程中，当为某个CPU中rq上正在运行的任务设置了`TIF_NEED_RESCHED`标志，意味着这个任务即将被其他任务抢占，即另外一个任务替代这个任务占用CPU资源，完成这个动作的函数是`schedule`函数。在`try_to_wake_up`中会将rq中正在执行的任务加上`TIF_NEED_RESCHED`标志，另外一个流程是定时器由驱动的rq的时间更新流程，在这个流程中可能会为rq中正在运行的任务添加`TIF_NEED_RESCHED`标记。在记录`schedule`函数之前，先记录高精度定时器是如何影响任务调度过程。
+在linux任务调度过程中，当为某个CPU中运行队列上正在运行的任务设置了`TIF_NEED_RESCHED`标志，意味着这个任务即将被其他任务抢占，即另外一个任务替代这个任务占用CPU资源，完成这个动作的函数是`schedule`函数。在`try_to_wake_up`中会将运行队列中正在执行的任务加上`TIF_NEED_RESCHED`标志，另外一个流程是定时器由驱动的运行队列的时间更新流程，在这个流程中可能会为运行队列中正在运行的任务添加`TIF_NEED_RESCHED`标记。在记录`schedule`函数之前，先记录高精度定时器是如何影响任务调度过程。
 
 ## 代码流程
 
 ### 1.高精度定时器
 
-本节关注高精度定时器对调度流程的影响，大致的流程是使用`hrtick_rq_init`函数初始化rq中高精度定时器，然后调用`__hrtick_restart`启用rq中的高精度定时器，当定时器触发时调用`hrtick`函数更新rq的时间相关字段。
+本节关注高精度定时器对调度流程的影响，大致的流程是使用`hrtick_rq_init`函数初始化运行队列中高精度定时器，然后调用`__hrtick_restart`启用运行队列中的高精度定时器，当定时器触发时调用`hrtick`函数更新运行队列的时间相关字段。
 
 #### `hrtick_rq_init`函数
 
@@ -21,7 +21,7 @@ static void hrtick_rq_init(struct rq *rq)
 }
 ```
 
-这个函数初始化rq中高精度定时器，这个定时器使用单调递增时钟、使用相对时间表示定时器触发时刻、在硬件中断上下文中运行，定时器触发是执行的函数是`hrtick`。同时还会初始化`call single data`相关的字段，`call single data`的用途在接下来的函数中说明。
+这个函数初始化运行队列中高精度定时器，这个定时器使用单调递增时钟、使用相对时间表示定时器触发时刻、在硬件中断上下文中运行，定时器触发是执行的函数是`hrtick`。同时还会初始化`call single data`相关的字段，`call single data`的用途在接下来的函数中说明。
 
 #### `hrtick_start`函数
 
@@ -50,7 +50,7 @@ void hrtick_start(struct rq *rq, u64 delay)
 }
 ```
 
-这个函数设置触发时间为当前时间加上至少10us的延迟时间，如果定时器所属的rq与当前运行CPU的rq相同，则调用`__krtick_restart`函数启动定时器，反之则通知rq所属cpu执行`__hrtick_start`函数启动定时器（`smp_call_function_single_async`）。
+这个函数设置触发时间为当前时间加上至少10us的延迟时间，如果定时器所属的运行队列与当前运行CPU的运行队列相同，则调用`__krtick_restart`函数启动定时器，反之则通知运行队列所属cpu执行`__hrtick_start`函数启动定时器（`smp_call_function_single_async`）。
 
 #### `__hrtick_restart`函数
 
@@ -83,7 +83,7 @@ static void __hrtick_start(void *arg)
 }
 ```
 
-这个函数在硬件中断上下文中执行（`IPI`中断）中执行，在持有rq锁的前提下在rq所在的CPU中调用`__hrtick_restart`函数启动高精度定时器。
+这个函数在硬件中断上下文中执行（`IPI`中断）中执行，在持有运行队列锁的前提下在运行队列所在的CPU中调用`__hrtick_restart`函数启动高精度定时器。
 
 #### `hrtick`函数
 
@@ -108,7 +108,7 @@ static enum hrtimer_restart hrtick(struct hrtimer *timer)
 }
 ```
 
-这个函数在持有rq锁的前提下，更新rq的时间相关字段、调用rq所在CPU中正在运行的任务使用的调度类的`task_tick`方法。注意到这个函数返回的是`HRTIMER_NORESTART`，意味着这个定时器不会自动启用，在调度类中才会继续启动这个定时器，例如CFS的`enqueue_task_fair`函数。在执行调度类的`task_tick`方法过程中会为当前正在运行的任务设置`TIF_NEED_RESCHED`标记，然后内核其他部分代码执行过程中调用`schedule`函数触发一次任务切换。
+这个函数在持有运行队列锁的前提下，更新运行队列的时间相关字段、调用运行队列所在CPU中正在运行的任务使用的调度类的`task_tick`方法。注意到这个函数返回的是`HRTIMER_NORESTART`，意味着这个定时器不会自动启用，在调度类中才会继续启动这个定时器，例如CFS的`enqueue_task_fair`函数。在执行调度类的`task_tick`方法过程中会为当前正在运行的任务设置`TIF_NEED_RESCHED`标记，然后内核其他部分代码执行过程中调用`schedule`函数触发一次任务切换。
 
 ### 2.任务切换
 
@@ -147,7 +147,7 @@ asmlinkage __visible void __sched schedule(void)
     rcu_note_context_switch(!!sched_mode);
 ```
 
-忽略`schedule_debug`、`rcu_note_context_switch`函数中的内容，这些代码禁用中断、停止rq中高精度定时器运行，在执行任务切换过程中高精度定时器到期触发的函数可能会对任务切换过程造成干扰，所以要停止高精度定时器。
+忽略`schedule_debug`、`rcu_note_context_switch`函数中的内容，这些代码禁用中断、停止运行队列中高精度定时器运行，在执行任务切换过程中高精度定时器到期触发的函数可能会对任务切换过程造成干扰，所以要停止高精度定时器。
 
 ```c
     /*
@@ -173,7 +173,7 @@ asmlinkage __visible void __sched schedule(void)
     update_rq_clock(rq);
 ```
 
-读写操作乱序可能会导致任务状态检测先于任务状态设置发生，这可能会导致`__schedule`函数与`signal_wake_up`函数产生冲突，所以在获取rq锁之后使用添加内存屏障保证读写之间的顺序（`smp_mb__after_spinlock`）。随后更新rq的时间并且标记rq中的时间更新操作已经执行。
+读写操作乱序可能会导致任务状态检测先于任务状态设置发生，这可能会导致`__schedule`函数与`signal_wake_up`函数产生冲突，所以在获取运行队列锁之后使用添加内存屏障保证读写之间的顺序（`smp_mb__after_spinlock`）。随后更新运行队列的时间并且标记运行队列中的时间更新操作已经执行。
 
 ```c
     switch_count = &prev->nivcsw;
@@ -217,7 +217,7 @@ asmlinkage __visible void __sched schedule(void)
     }
 ```
 
-在将被抢占的任务不再处于正在运行状态、没有禁止任务抢占的情况下，若任务有待处理的信号则将任务设置为正在运行状态，否则这个任务是不可中断的任务。不可被中断的任务含义是此时任务处于休眠状态并且还不能被信号唤醒，当一个任务在执行磁盘io或者DMA操作时任务不可中断，忽略`prev->in_iowait`为真时执行的代码，此时若任务对系统负载有影响则更新rq中不可中断任务计数器，此时任务虽然不可中断但是依然处于睡眠状态，调用`deactivate_task`函数将任务从rq中移除，`deactivate_task`函数的具体流程在`task_wake_up.md`文件中记录。
+在将被抢占的任务不再处于正在运行状态、没有禁止任务抢占的情况下，若任务有待处理的信号则将任务设置为正在运行状态，否则这个任务是不可中断的任务。不可被中断的任务含义是此时任务处于休眠状态并且还不能被信号唤醒，当一个任务在执行磁盘io或者DMA操作时任务不可中断，忽略`prev->in_iowait`为真时执行的代码，此时若任务对系统负载有影响则更新运行队列中不可中断任务计数器，此时任务虽然不可中断但是依然处于睡眠状态，调用`deactivate_task`函数将任务从运行队列中移除，`deactivate_task`函数的具体流程在`task_wake_up.md`文件中记录。
 
 ```c
     next = pick_next_task(rq, prev, &rf);
@@ -271,9 +271,9 @@ asmlinkage __visible void __sched schedule(void)
     }
 ```
 
-当即将运行的任务与被抢占的任务相同时，忽略`rq_unpin_lock`函数，更新rq的`clock_update_flags`来表示rq的时间相关字段已经更新，调用任务负载均衡功能相关的回调函数、释放rq锁并且恢复中断。
+当即将运行的任务与被抢占的任务相同时，忽略`rq_unpin_lock`函数，更新运行队列的`clock_update_flags`来表示运行队列的时间相关字段已经更新，调用任务负载均衡功能相关的回调函数、释放运行队列锁并且恢复中断。
 
-当即将运行的任务与被抢占任务不同是一个任务时，首先使用`RCU`机制更新rq正在运行的任务为即将运行的任务、递增`switch_count`、`nr_switches`等统计字段，调用`migrate_disable_switch`函数禁止任务在cpu之间移动，调用`context_switch`执行任务切换。忽略`psi_account_irqtime`、`psi_sched_switch`、`trace_sched_switch`函数内容，在后边详细记录`migrate_disable_switch`、`context_switch`函数内容。
+当即将运行的任务与被抢占任务不同是一个任务时，首先使用`RCU`机制更新运行队列正在运行的任务为即将运行的任务、递增`switch_count`、`nr_switches`等统计字段，调用`migrate_disable_switch`函数禁止任务在cpu之间移动，调用`context_switch`执行任务切换。忽略`psi_account_irqtime`、`psi_sched_switch`、`trace_sched_switch`函数内容，在后边详细记录`migrate_disable_switch`、`context_switch`函数内容。
 
 #### `pick_next_task`函数
 
@@ -297,7 +297,7 @@ asmlinkage __visible void __sched schedule(void)
     }
 ```
 
-这部分代码是函数最开始执行的代码逻辑，考虑两种比较简单的情况，若`core_schedule`特性未启用或者参数中rq所在的cpu无法使用，则调用`__pick_next_task`函数返回下一个可以执行的任务，后边会详细记录这个函数的流程。
+这部分代码是函数最开始执行的代码逻辑，考虑两种比较简单的情况，若`core_schedule`特性未启用或者参数中运行队列所在的cpu无法使用，则调用`__pick_next_task`函数返回下一个可以执行的任务，后边会详细记录这个函数的流程。
 
 ```c
     /*
@@ -325,7 +325,7 @@ asmlinkage __visible void __sched schedule(void)
     }
 ```
 
-这部分代码关心到新进程的调度，这里边的逻辑涉及到`core_task_seq`、`core_pick_seq`、`core_sched_seq`三个字段的值的判断，`core_task_seq`在每次将任务放入到rq、从rq中出队时都会递增，这意味着接下来要执行的进程会发生变化；`core_pick_seq`标记某次的rq入队或出队操作是否有新的任务选择与之对应，即rq入队或出队操作之后执行了新运行任务的选择，则将`core_pick_seq`的值更新为`core_task_seq`的值，此时新选择的任务放在`rq->core_pick`字段。当新运行的任务即将抢占其他占用cpu的任务时将`core_sched_seq`更新为`core_pick_seq`的值。因为在rq上进行入队、出队操作之后可能并不会立马进行新执行任务的选择，进行了新的任务选择之后并不会立马让新选择的任务抢占其他的任务，所以需要使用这三个字段来同步rq变动、新的任务选择、新的任务调度这三个过程。若`rq->core->core_pick_seq == rq->core->core_task_seq`并且`rq->core->core_pick_seq != rq->core_sched_seq`相同时表示rq变动之后已经选择了新的任务，但是新的任务还没有执行。此时若`rq->core_pick`不为空并且不是正在运行的任务，调用调度类的`put_prev_task`（当任务被抢占时执行此方法）、`set_next_task`方法（当任务抢占其他任务的时候执行此方法），然后跳转到`out`这个标签处继续执行。
+这部分代码关心到新进程的调度，这里边的逻辑涉及到`core_task_seq`、`core_pick_seq`、`core_sched_seq`三个字段的值的判断，`core_task_seq`在每次将任务放入到运行队列、从运行队列中出队时都会递增，这意味着接下来要执行的进程会发生变化；`core_pick_seq`标记某次的运行队列入队或出队操作是否有新的任务选择与之对应，即运行队列入队或出队操作之后执行了新运行任务的选择，则将`core_pick_seq`的值更新为`core_task_seq`的值，此时新选择的任务放在`rq->core_pick`字段。当新运行的任务即将抢占其他占用cpu的任务时将`core_sched_seq`更新为`core_pick_seq`的值。因为在运行队列上进行入队、出队操作之后可能并不会立马进行新执行任务的选择，进行了新的任务选择之后并不会立马让新选择的任务抢占其他的任务，所以需要使用这三个字段来同步运行队列变动、新的任务选择、新的任务调度这三个过程。若`rq->core->core_pick_seq == rq->core->core_task_seq`并且`rq->core->core_pick_seq != rq->core_sched_seq`相同时表示运行队列变动之后已经选择了新的任务，但是新的任务还没有执行。此时若`rq->core_pick`不为空并且不是正在运行的任务，调用调度类的`put_prev_task`（当任务被抢占时执行此方法）、`set_next_task`方法（当任务抢占其他任务的时候执行此方法），然后跳转到`out`这个标签处继续执行。
 
 ```c
     put_prev_task_balance(rq, prev, rf);
@@ -334,7 +334,7 @@ asmlinkage __visible void __sched schedule(void)
     need_sync = !!rq->core->core_cookie;
 ```
 
-这三行代码与后边的流程紧密相关，逐一记录每行代码的含义。`put_prev_task_balance`函数按照优先级从高到低的顺序调用调度类的`balance`方法，然后对即将被抢占的任务调用调度类的`put_prev_task`函数，后边会详细记录`put_prev_task_balance`函数流程。`smt`是`Simultaneous Multi-Threading`的缩写，intel的许多处理器都支持超线程技术，开启超线程技术的情况下一颗物理内核对应两颗虚拟内核，这种情况就叫做`Simultaneous Multi-Threading`技术。`cpu_smt_mask`返回的是所有的逻辑cpu，这些cpu实际上是同一颗物理cpu通过`SMT`技术（例如intel的超线程技术）虚拟出来的。`need_sync`表明当前的rq中是否设置了`core_cookie`的值。
+这三行代码与后边的流程紧密相关，逐一记录每行代码的含义。`put_prev_task_balance`函数按照优先级从高到低的顺序调用调度类的`balance`方法，然后对即将被抢占的任务调用调度类的`put_prev_task`函数，后边会详细记录`put_prev_task_balance`函数流程。`smt`是`Simultaneous Multi-Threading`的缩写，intel的许多处理器都支持超线程技术，开启超线程技术的情况下一颗物理内核对应两颗虚拟内核，这种情况就叫做`Simultaneous Multi-Threading`技术。`cpu_smt_mask`返回的是所有的逻辑cpu，这些cpu实际上是同一颗物理cpu通过`SMT`技术（例如intel的超线程技术）虚拟出来的。`need_sync`表明当前的运行队列中是否设置了`core_cookie`的值。
 
 ```c
     /* reset state */
@@ -378,7 +378,7 @@ asmlinkage __visible void __sched schedule(void)
     cookie = rq->core->core_cookie = max->core_cookie;
 ```
 
-当还没有一个`core_cookie`设置到某个逻辑cpu上时，此时cpu中运行的可能是idle task，调用`pick_task`函数按照调度类的优先级调用每个调度类的`pick_task`方法，直到某个调度类的`pick_next`方法返回一个任务，这个任务就是接下来在这个逻辑cpu上执行的任务。若选出来的task中没有设置`core_cookie`，调用CFS的`task_vruntime_update`函数更新cfs_rq的`min_vruntime_fi`字段，这里忽略这个字段的含义。接下来代码跳转到`out_set_next`标记处继续执行。
+当还没有一个`core_cookie`设置到某个逻辑cpu上时，此时cpu中运行的可能是idle task，调用`pick_task`函数按照调度类的优先级调用每个调度类的`pick_task`方法，直到某个调度类的`pick_next`方法返回一个任务，这个任务就是接下来在这个逻辑cpu上执行的任务。若选出来的task中没有设置`core_cookie`，调用CFS的`task_vruntime_update`函数更新CFS运行队列的`min_vruntime_fi`字段，这里忽略这个字段的含义。接下来代码跳转到`out_set_next`标记处继续执行。
 
 ```c
     /*
@@ -406,7 +406,7 @@ asmlinkage __visible void __sched schedule(void)
     cookie = rq->core->core_cookie = max->core_cookie;
 ```
 
-当某个逻辑cpu的`core_cookie`在之前已经设置，会执行这部段代码。这段代码是从某个物理cpu的某个逻辑cpu开始编译这个物理cpu上的所有逻辑cpu，从中选出来优先级最高的task，将这个task的`core_cookie`设置为这个逻辑cpu的`core_cookie`。在遍历过程中还会选出来优先级最高的任务，将物理cpu的`core_cookie`设置为优先级最高任务的`core_cookie`。<u>遍历过程中还会考虑更新逻辑cpu的rq时间，可以参照注释内容简单理解，细节以后补充。</u>
+当某个逻辑cpu的`core_cookie`在之前已经设置，会执行这部段代码。这段代码是从某个物理cpu的某个逻辑cpu开始编译这个物理cpu上的所有逻辑cpu，从中选出来优先级最高的task，将这个task的`core_cookie`设置为这个逻辑cpu的`core_cookie`。在遍历过程中还会选出来优先级最高的任务，将物理cpu的`core_cookie`设置为优先级最高任务的`core_cookie`。<u>遍历过程中还会考虑更新逻辑cpu的运行队列时间，可以参照注释内容简单理解，细节以后补充。</u>
 
 ```c
     /*
@@ -439,7 +439,7 @@ asmlinkage __visible void __sched schedule(void)
     }
 ```
 
-现在已经确定了物理cpu的`core_cookie`的值，那个物理cpu对应的逻辑cpu中运行任务的`core_cookie`的值要与物理cpu的`core_cookie`的值相同。这个`for`循环迭代物理cpu中的每个逻辑cpu，判断逻辑cpu中即将运行任务的`core_cookie`的值是否与物理cpu的`core_cookie`的值相同，若不同则调用`sched_core_find`找到一个新的任务，若找不到这样的任务则使用idle task。当为正在遍历的cpu寻找到的新任务是idle task，则需要更新`core_forceidle_count`以及`core_forceidle_seq`两个字段的值：当逻辑cpu对应的rq中有可运行任务的计数不为0时，即此时有可以运行的任务、但是不得不运行idle task，因此`core_forceidle_count`递增；当上次执行`pick_next_task`时未出现强制让某个逻辑cpu运行idle task的情况，将`core_forceidle_seq`递增用以记录逻辑cpu不得不执行idle task出现的次数。
+现在已经确定了物理cpu的`core_cookie`的值，那个物理cpu对应的逻辑cpu中运行任务的`core_cookie`的值要与物理cpu的`core_cookie`的值相同。这个`for`循环迭代物理cpu中的每个逻辑cpu，判断逻辑cpu中即将运行任务的`core_cookie`的值是否与物理cpu的`core_cookie`的值相同，若不同则调用`sched_core_find`找到一个新的任务，若找不到这样的任务则使用idle task。当为正在遍历的cpu寻找到的新任务是idle task，则需要更新`core_forceidle_count`以及`core_forceidle_seq`两个字段的值：当逻辑cpu对应的运行队列中有可运行任务的计数不为0时，即此时有可以运行的任务、但是不得不运行idle task，因此`core_forceidle_count`递增；当上次执行`pick_next_task`时未出现强制让某个逻辑cpu运行idle task的情况，将`core_forceidle_seq`递增用以记录逻辑cpu不得不执行idle task出现的次数。
 
 ```c
     if (schedstat_enabled() && rq->core->core_forceidle_count) {
@@ -455,7 +455,7 @@ asmlinkage __visible void __sched schedule(void)
     WARN_ON_ONCE(!next);
 ```
 
-接下来更新统计字段，包含最近一次强制让某个逻辑cpu运行idle task的时间以及出现次数。最重要的是更新`core_pick_seq`以及`core_sched_seq`的值为`core_task_seq`，表明新的任务选择过程中已经考虑到了之前rq的变动，即考虑到了在rq中的出队、入队操作。
+接下来更新统计字段，包含最近一次强制让某个逻辑cpu运行idle task的时间以及出现次数。最重要的是更新`core_pick_seq`以及`core_sched_seq`的值为`core_task_seq`，表明新的任务选择过程中已经考虑到了之前运行队列的变动，即考虑到了在运行队列中的出队、入队操作。
 
 ```c
     /*
@@ -509,7 +509,7 @@ asmlinkage __visible void __sched schedule(void)
     }
 ```
 
-虽然在上边的逻辑中已经为从属于某个物理cpu的所有逻辑cpu选择了新的要执行的任务，但是这些逻辑cpu目前可能还无法感知这个变化，这个`for`循环遍历所有逻辑cpu，通过调用`resched_curr`函数并传入逻辑cpu的rq，通知这个逻辑cpu需要让新选择的任务抢占当前执行的任务以保持逻辑cpu中执行任务的`core_cookie`完全一致。在通知之前需要考虑这几种情况：1).未能给某个逻辑cpu选择下一个执行的任务，这个cpu可能处于不可用状态，此时填过这个cpu，2).若上次运行`pick_next_task`时没有强制某个逻辑cpu运行idle task但是本次执行却有这个要求，则调用CFS的`task_vruntime_update`函数更新cfs_rq的`min_vruntime_fi`字段（这里忽略这个字段的含义），3).若正在遍历的逻辑cpu为执行`pick_next_task`函数的逻辑cpu，这个cpu已经知道要使用新的任务替换正在执行的任务，不需要额外通知，4).若某个逻辑cpu中正在运行的任务和新选择的任务相同同样不需要额外通知。
+虽然在上边的逻辑中已经为从属于某个物理cpu的所有逻辑cpu选择了新的要执行的任务，但是这些逻辑cpu目前可能还无法感知这个变化，这个`for`循环遍历所有逻辑cpu，通过调用`resched_curr`函数并传入逻辑cpu的运行队列，通知这个逻辑cpu需要让新选择的任务抢占当前执行的任务以保持逻辑cpu中执行任务的`core_cookie`完全一致。在通知之前需要考虑这几种情况：1).未能给某个逻辑cpu选择下一个执行的任务，这个cpu可能处于不可用状态，此时填过这个cpu，2).若上次运行`pick_next_task`时没有强制某个逻辑cpu运行idle task但是本次执行却有这个要求，则调用CFS的`task_vruntime_update`函数更新CFS运行队列的`min_vruntime_fi`字段（这里忽略这个字段的含义），3).若正在遍历的逻辑cpu为执行`pick_next_task`函数的逻辑cpu，这个cpu已经知道要使用新的任务替换正在执行的任务，不需要额外通知，4).若某个逻辑cpu中正在运行的任务和新选择的任务相同同样不需要额外通知。
 
 ```c
 out_set_next:
@@ -570,7 +570,7 @@ restart:
 }
 ```
 
-如果rq中运行的所有任务都是由CFS来接管、CFS比被抢占任务关联的调度类优先级更高，那么调用`pick_next_task_fair`函数选择接下来运行的任务，如果无法找到接下来运行的任务则选择一个idle task任务运行并且对即将被抢占的任务调用`put_prev_task`函数，在`put_prev_task`函数中会调用即将被抢占的任务关联的调度类的`put_prev_task`方法。当`pick_next_task_fair`返回`RETRY_TASK`时，调用`put_prev_task_balance`函数进行任务负载均衡以明确接下来需要运行的任务、遍历每个调度类选出接下来运行的任务。
+如果运行队列中运行的所有任务都是由CFS来接管、CFS比被抢占任务关联的调度类优先级更高，那么调用`pick_next_task_fair`函数选择接下来运行的任务，如果无法找到接下来运行的任务则选择一个idle task任务运行并且对即将被抢占的任务调用`put_prev_task`函数，在`put_prev_task`函数中会调用即将被抢占的任务关联的调度类的`put_prev_task`方法。当`pick_next_task_fair`返回`RETRY_TASK`时，调用`put_prev_task_balance`函数进行任务负载均衡以明确接下来需要运行的任务、遍历每个调度类选出接下来运行的任务。
 
 #### `put_prev_task_balance`函数
 
@@ -618,7 +618,7 @@ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
 }
 ```
 
-这个函数调用`__do_set_cpus_allowed`保证任务`p`无法调度到rq所属cpu之中，第二个参数指定任务在cpu转移过程中排除的cpu，第三个参数为禁用任务转移的标记。在此之前还要进行一些基本情况判断，当没有禁用任务`p`在cpu之间移动时、当任务`p`和其他的任务共享同一组cpu时（`p->cpu_ptr != &p->cpus_mask`）都不进行任何操作。
+这个函数调用`__do_set_cpus_allowed`保证任务`p`无法调度到运行队列所属cpu之中，第二个参数指定任务在cpu转移过程中排除的cpu，第三个参数为禁用任务转移的标记。在此之前还要进行一些基本情况判断，当没有禁用任务`p`在cpu之间移动时、当任务`p`和其他的任务共享同一组cpu时（`p->cpu_ptr != &p->cpus_mask`）都不进行任何操作。
 
 #### `context_switch`函数
 
@@ -690,7 +690,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 
 当新运行的任务为内核线程（`next->mm`为空），执行`enter_lazy_tlb`函数跳过重新向`TLB`缓存之中写入新任务的页表项，之所以能够跳过这一步是因为在linux中运行的所有的任务（包含内核线程、用户态进程、进程中的线程）使用的内核空间都是相同的并且内核线程不需要访问用户态内存空间，所以复用被抢占任务的`TLB`缓存是没问题的。这里详细介绍`mm`与`active_mm`之间的关系，`mm`为一个进程的虚拟地址空间，对于进程而言`active_mm`以及`mm`字段的值都是相同的，对于内核线程而言`active_mm`直接引用为上一个运行的进程的虚拟地址空间。当被抢占的任务为进程，即将运行的内核线程直接引用进程的虚拟地址空间，递增`mm`的引用计数；当被抢占的任务、新运行的任务都是内核线程，使用`next->active_mm = prev->active_mm`来引用之前运行进程的虚拟地址空间。
 
-当新运行的任务为进程时，将rq的`membarrier_state`设置为进程虚拟地址空间的`membarrier_state`状态，`membarrier_state`为`membarrier`系统调用中的内容，具体含义见这个系统调用的说明文档。`switch_mm_irqs_off`函数负责处理在任务切换时`TLB`以及内存管理相关结构的切换。`lru_gen_use_mm`函数标记新任务的虚拟地址空间中的内存最近被使用过，尽量其中的内存页换出操作。当被抢占的任务为内核线程时，在rq中保存内核线程引用的虚拟地址空间，在`finish_task_switch`将会解除对这个用户态空间的引用。
+当新运行的任务为进程时，将运行队列的`membarrier_state`设置为进程虚拟地址空间的`membarrier_state`状态，`membarrier_state`为`membarrier`系统调用中的内容，具体含义见这个系统调用的说明文档。`switch_mm_irqs_off`函数负责处理在任务切换时`TLB`以及内存管理相关结构的切换。`lru_gen_use_mm`函数标记新任务的虚拟地址空间中的内存最近被使用过，尽量其中的内存页换出操作。当被抢占的任务为内核线程时，在运行队列中保存内核线程引用的虚拟地址空间，在`finish_task_switch`将会解除对这个用户态空间的引用。
 
 上边的代码中提到了`switch_mm_irqs_off`函数，这个函数用于切换内存管理相关的内容，这里简要介绍这个函数的内容。若任务切换不会导致`TLB`缓存的内存页对应地址空间不变，则进一步确定`TLB`缓存中内容是否需要更新，在`TLB`缓存的内存页对应地址空间中添加当前运行cpu的使用标记；若发生变化在之前的地址空间中清除当前cpu的使用标记、在新的地址空间中添加当前cpu的使用标记，选择新的`ASID`（用于标识新的地址空间），在选择新的`ASID`的时候可能会要求更新`TLB`缓存中的内容。无论哪种情况，一旦要求更新`TLB`缓存中的内容，调用`load_new_mm_cr3`触发`TLB`缓存更新。在后一种情况中还会调用`cond_mitigation`函数，这个函数用于处理`Spectre`漏洞。
 
@@ -812,7 +812,7 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 }
 ```
 
-这个函数首先判断抢占计数是否为2，若不为2强制设置为2，这是因为在执行`schedule`函数开始到现在会调用两次`preempt_disable`函数，每次调用这个函数会递增抢占计数。`vtime_task_switch`函数涉及到任务和cpu的时间统计、`perf_event_task_sched_in`涉及性记录任务调入到cpu事件的性能记录、`tick_nohz_task_switch`函数涉及到一种特殊的定时器，忽略这几个函数中的内容。`finish_task`函数将被抢占任务的`on_cpu`字段设置为0并且保证`RELEASE`语义的内存同步，`finish_lock_switch`函数触发rq中任务负载均衡相关的回调函数、释放rq锁并恢复中断，`finish_arch_post_lock_switch`在`x86_64`架构中是一个空函数。
+这个函数首先判断抢占计数是否为2，若不为2强制设置为2，这是因为在执行`schedule`函数开始到现在会调用两次`preempt_disable`函数，每次调用这个函数会递增抢占计数。`vtime_task_switch`函数涉及到任务和cpu的时间统计、`perf_event_task_sched_in`涉及性记录任务调入到cpu事件的性能记录、`tick_nohz_task_switch`函数涉及到一种特殊的定时器，忽略这几个函数中的内容。`finish_task`函数将被抢占任务的`on_cpu`字段设置为0并且保证`RELEASE`语义的内存同步，`finish_lock_switch`函数触发运行队列中任务负载均衡相关的回调函数、释放运行队列锁并恢复中断，`finish_arch_post_lock_switch`在`x86_64`架构中是一个空函数。
 
 忽略`kcov_finish_switch`、`kmap_local_sched_in`函数内容，提醒即将运行任务的事件监听者此任务被调度cpu执行（在`fire_sched_in_preempt_notifiers`中调用监听者注册的`sched_in`方法）。若被抢占任务为一个进程，考虑是否在返回用户态之前执行`SERIALIZE`指令，若新旧任务的地址空间不同或者新任务地址空间的内存屏障状态中包含`PRIVATE_EXPEDITED_SYNC_CORE`标记则跳过执行（忽略这个标记的含义），其他的情况需要执行`SERIALIZE`指令（在intel的指令集手册中，`SERIALIZE`指令的含义为`Before the next instruction is fetched and executed, the SERIALIZE instruction ensures that all modifications to flags, registers, and memory by previous instructions are completed, draining all buffered writes to memory`，即在这个指令之前素有指令都会得到执行，这是为了保证在返回用户态之前所有内核态的操作全部执行完成），随后取消对被抢占任务的地址空间的引用。
 

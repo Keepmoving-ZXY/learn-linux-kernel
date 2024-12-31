@@ -154,9 +154,9 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 
 这个函数的流程如下：
 
-1.获取task所在rq的锁，这个锁是一个自旋锁；
+1.获取task所在运行队列的锁，这个锁是一个自旋锁；
 
-2.如果task已经被放入到某个rq之中则更新rq中涉及到时间的各种字段；
+2.如果task已经被放入到某个运行队列之中则更新运行队列中涉及到时间的各种字段；
 
 3.尝试唤醒任务
 
@@ -187,7 +187,7 @@ struct rq *__task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 }
 ```
 
-考虑到task可能正在CPU之间移动，有可能会出现此时获取到的锁并不是task在移动到指定CPU的锁这种情况，所以代码使用一个`for`循环来处理来规避这个问题。通过`raw_spin_rq_lock`获取rq的锁，然后在保证task已经完成迁移并且获取到了迁移之后cpu的rq的锁才会返回，否则继续进行循环。
+考虑到task可能正在CPU之间移动，有可能会出现此时获取到的锁并不是task在移动到指定CPU的锁这种情况，所以代码使用一个`for`循环来处理来规避这个问题。通过`raw_spin_rq_lock`获取运行队列的锁，然后在保证task已经完成迁移并且获取到了迁移之后cpu的运行队列的锁才会返回，否则继续进行循环。
 
 ##### `update_rq_clock`函数
 
@@ -215,11 +215,11 @@ void update_rq_clock(struct rq *rq)
 }
 ```
 
-这个函数用于更新rq中时间相关的字段，参数中的rq为任务所在CPU的rq，忽略函数中死锁检测（`lockdep_assert_rq_held`）、SCHED_DEBUG（`CONFIG_SCHED_DEBUG`宏定义包含的代码）相关的内容，函数的流程如下：
+这个函数用于更新运行队列中时间相关的字段，参数中的`rq`为任务所在CPU的运行队列，忽略函数中死锁检测（`lockdep_assert_rq_held`）、SCHED_DEBUG（`CONFIG_SCHED_DEBUG`宏定义包含的代码）相关的内容，函数的流程如下：
 
-1.更新rq的时间，这个时间是系统启动之后与现在的时间间隔，单位是纳秒；
+1.更新运行队列的时间，这个时间是系统启动之后与现在的时间间隔，单位是纳秒；
 
-2.更新rq中其他的字段，主要在`update_rq_clock_task`函数中完成；
+2.更新运行队列中其他的字段，主要在`update_rq_clock_task`函数中完成；
 
 ##### `update_rq_clock_task`函数
 
@@ -279,7 +279,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 }
 ```
 
-忽略`CONFIG_HAVE_SCHED_AVG_IRQ`、`CONFIG_IRQ_TIME_ACCOUNTING`这两个宏启用的代码逻辑，这个函数增加了rq中任务执行占用的时间，这个时间值在某些情况下与`rq->clock`的值不一致，因为要考虑到虚拟化部分的逻辑（见`CONFIG_PARAVIRT_TIME_ACCOUNTING`宏启用的代码逻辑），随后调用`update_rq_clock_pelt`更新rq中pelt（[per-entity load tracking](https://docs.kernel.org/scheduler/schedutil.html)）相关的计数器。
+忽略`CONFIG_HAVE_SCHED_AVG_IRQ`、`CONFIG_IRQ_TIME_ACCOUNTING`这两个宏启用的代码逻辑，这个函数增加了运行队列中任务执行占用的时间，这个时间值在某些情况下与`rq->clock`的值不一致，因为要考虑到虚拟化部分的逻辑（见`CONFIG_PARAVIRT_TIME_ACCOUNTING`宏启用的代码逻辑），随后调用`update_rq_clock_pelt`更新运行队列中pelt（[per-entity load tracking](https://docs.kernel.org/scheduler/schedutil.html)）相关的计数器。
 
 ##### `update_rq_clock_pelt`函数
 
@@ -357,7 +357,7 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 
 这个函数的流程如下：
 
-1.检查当前rq中执行的任务是否可以被抢占，由`check_preempt_curr`函数实现；
+1.检查当前运行队列中执行的任务是否可以被抢占，由`check_preempt_curr`函数实现；
 
 2.设置任务状态为`TASK_RUNNING`；
 
@@ -365,7 +365,7 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 
 4.更新CPU空闲时间统计。
 
-检查rq中正在执行任务是否可以被抢占的逻辑在`check_preempt_curr`函数中详细说明，这里说明CPU空闲时间统计相关的逻辑。当rq处于空闲状态时会更新`idle_stamp`为进入空闲状态的时间戳，得到rq空闲时间之后更新rq的平均空闲时间，这个空闲时间是计算方式如下代码所示：
+检查运行队列中正在执行任务是否可以被抢占的逻辑在`check_preempt_curr`函数中详细说明，这里说明CPU空闲时间统计相关的逻辑。当运行队列处于空闲状态时会更新`idle_stamp`为进入空闲状态的时间戳，得到运行队列空闲时间之后更新运行队列的平均空闲时间，这个空闲时间是计算方式如下代码所示：
 
 ```c
 static inline void update_avg(u64 *avg, u64 sample)
@@ -375,7 +375,7 @@ static inline void update_avg(u64 *avg, u64 sample)
 }
 ```
 
-为了防止平均空闲时间过长导致调度器一直向这个CPU中调度新的任务，需要限制rq的平均空闲时间最大值为`max_idle_balance_cost`的2倍。更新rq的平均空闲时间的同时也更新了`wake_stamp`、`wake_avg_idle`字段的值，这些字段都在调度器进行负载均衡过程中使用，例如某些CPU处于比较繁忙的状态而另外一些CPU处于空闲状态，就可以将忙碌CPU的rq中任务调度到空闲CPU中执行。
+为了防止平均空闲时间过长导致调度器一直向这个CPU中调度新的任务，需要限制运行队列的平均空闲时间最大值为`max_idle_balance_cost`的2倍。更新运行队列的平均空闲时间的同时也更新了`wake_stamp`、`wake_avg_idle`字段的值，这些字段都在调度器进行负载均衡过程中使用，例如某些CPU处于比较繁忙的状态而另外一些CPU处于空闲状态，就可以将忙碌CPU的运行队列中任务调度到空闲CPU中执行。
 
 ##### `check_preempt_curr`函数
 
@@ -396,7 +396,7 @@ void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
 }
 ```
 
-若被唤醒的任务与rq中正在执行的任务使用同一个调度类（比如都是用CFS），则调用调度类自己定义的`check_preempt_curr`函数进行抢占检查；若使用不同的调度类，若被唤醒进程的调度类优先级比rq中正在运行的task使用的调度类高，则添加抢占正在运行的任务相关标识（`resched_curr`函数，下边详细介绍它的流程）。当rq中正在运行的任务在rq中并且它将会被抢占，这说明马上要进行任务调度，使用`rq_clock_skip_update`跳过在执行抢占过程中调度器时间相关字段更新。
+若被唤醒的任务与运行队列中正在执行的任务使用同一个调度类（比如都是用CFS），则调用调度类自己定义的`check_preempt_curr`函数进行抢占检查；若使用不同的调度类，若被唤醒进程的调度类优先级比运行队列中正在运行的task使用的调度类高，则添加抢占正在运行的任务相关标识（`resched_curr`函数，下边详细介绍它的流程）。当运行队列中正在运行的任务在运行队列中并且它将会被抢占，这说明马上要进行任务调度，使用`rq_clock_skip_update`跳过在执行抢占过程中调度器时间相关字段更新。
 
 ##### `resched_curr`函数
 
@@ -428,13 +428,13 @@ void resched_curr(struct rq *rq)
 
 忽略`lockdep_assert_rq_held`、`trace_sched_wake_idle_without_ipi`函数，这个函数的整体流程如下：
 
-1.若rq中正在执行的任务设置了被抢占的标志，则退出函数；
+1.若运行队列中正在执行的任务设置了被抢占的标志，则退出函数；
 
-2.若被唤醒任务所在的rq所属的CPU与当前CPU是同一个CPU，则设置两个标志然后退出；
+2.若被唤醒任务所在的运行队列所属的CPU与当前CPU是同一个CPU，则设置两个标志然后退出；
 
-3.若不是同一个CPU，为rq中正在执行的任务设置被抢占标志；
+3.若不是同一个CPU，为运行队列中正在执行的任务设置被抢占标志；
 
-4.若rq所属CPU不会主动轮询重新调度信息，则通过`smp_send_reschedule`函数通知；
+4.若运行队列所属CPU不会主动轮询重新调度信息，则通过`smp_send_reschedule`函数通知；
 
 #### 2.3. 任务放入wake list
 
@@ -787,7 +787,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
 }
 ```
 
-忽略代码中`lockdep_assert_held`、`lockdep_assert_rq_held`函数，若禁止了任务在CPU之间转移并且当任务不在任何CPU中时会产生一条警告日志。若任务在某个rq之中，则先后执行`dequeue_task`、`enqueue_task`函数，若任务为当前rq中正在运行的任务则先后执行`put_prev_task`以及`set_next_task`函数。当这个任务正在rq队列之中时，这个修改会影响调度过程中的许多细节，因此需要将任务从rq中出队然后入；当这个任务为正在运行的任务时，修改任务可以使用的CPU会影响调度类中的许多细节，因此需要先执行调度器特有的`put_prev_task`以及`set_next_task`将任务先后放到调度类的就绪队列、执行队列之中。`put_prev_task`与`set_next_task`调用调度类的`put_prev_task`方法以及`set_next_task`方法，接下来关注`dequeue_task`、`enqueue_task`函数。
+忽略代码中`lockdep_assert_held`、`lockdep_assert_rq_held`函数，若禁止了任务在CPU之间转移并且当任务不在任何CPU中时会产生一条警告日志。若任务在某个运行队列之中，则先后执行`dequeue_task`、`enqueue_task`函数，若任务为当前运行队列中正在运行的任务则先后执行`put_prev_task`以及`set_next_task`函数。当这个任务正在运行队列队列之中时，这个修改会影响调度过程中的许多细节，因此需要将任务从运行队列中出队然后入；当这个任务为正在运行的任务时，修改任务可以使用的CPU会影响调度类中的许多细节，因此需要先执行调度器特有的`put_prev_task`以及`set_next_task`将任务先后放到调度类的就绪队列、执行队列之中。`put_prev_task`与`set_next_task`调用调度类的`put_prev_task`方法以及`set_next_task`方法，接下来关注`dequeue_task`、`enqueue_task`函数。
 
 ##### `dequeue_task`函数
 
@@ -810,7 +810,7 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 }
 ```
 
-这个函数会调用调度类的`dequeue_task`方法，若未指定`DEQUEUE_NOCLOCK`则更新rq的时间相关字段，若启用了core schedule([Core Scheduling &#8212; The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_dequeue`更新相关字段，忽略`sched_info_dequeue`、`psi_dequeue`、`uclamp_rq_dec`这三个函数。
+这个函数会调用调度类的`dequeue_task`方法，若未指定`DEQUEUE_NOCLOCK`则更新运行队列的时间相关字段，若启用了core schedule([Core Scheduling &#8212; The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_dequeue`更新相关字段，忽略`sched_info_dequeue`、`psi_dequeue`、`uclamp_rq_dec`这三个函数。
 
 `update_rq_clock`函数的流程之前已经提及，`sched_core_dequeue`函数内容如下：
 
@@ -835,7 +835,7 @@ void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
 }
 ```
 
-这个函数将任务从红黑树中移除，在强制rq所在CPU为空闲状态、当前运行的任务为idle任务时调用`resched_curr`将它转移到其他的CPU中去。
+这个函数将任务从红黑树中移除，在强制运行队列所在CPU为空闲状态、当前运行的任务为idle任务时调用`resched_curr`将它转移到其他的CPU中去。
 
 ##### `enqueue_task`函数
 
@@ -858,7 +858,7 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 }
 ```
 
-忽略`sched_info_enqueue`、`psi_enqueue`、`uclamp_rq_inc`这三个函数，这个函数调用了调度类特有的`enqueue_task`方法，若未指定`ENQUEUE_NOCLOCK`则更新rq时间相关字段，若启用了[core schedule]([Core Scheduling — The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_enqueue`函数更新相关字段，`sched_core_enqueue`函数内容如下：
+忽略`sched_info_enqueue`、`psi_enqueue`、`uclamp_rq_inc`这三个函数，这个函数调用了调度类特有的`enqueue_task`方法，若未指定`ENQUEUE_NOCLOCK`则更新运行队列时间相关字段，若启用了[core schedule]([Core Scheduling — The Linux Kernel documentation](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html))特性则调用`sched_core_enqueue`函数更新相关字段，`sched_core_enqueue`函数内容如下：
 
 ```c
 void sched_core_enqueue(struct rq *rq, struct task_struct *p)
@@ -986,7 +986,7 @@ static inline void __set_task_cpu(struct task_struct *p, unsigned int cpu)
 }
 ```
 
-使用`set_task_rq`更新任务所在的rq以及相关字段，接下来为任务设置新的运行CPU以及唤醒CPU，设置任务运行的新的CPU时使用`WRITE_ONCE`保证缓存一致性，在更新这两个信息之前使用写屏障来保证之前的写操作都已经完成。使用写屏障的原因在于一旦`cpu`字段的值被更新，会激活调度器中的其他函数，这些函数可能会使用在设置`cpu`字段之前更新的字段的值，所以要保证在更新`cpu`字段之前其他的字段更新已经完成。接下来关注`set_task_rq`函数。
+使用`set_task_rq`更新任务所在的运行队列以及相关字段，接下来为任务设置新的运行CPU以及唤醒CPU，设置任务运行的新的CPU时使用`WRITE_ONCE`保证缓存一致性，在更新这两个信息之前使用写屏障来保证之前的写操作都已经完成。使用写屏障的原因在于一旦`cpu`字段的值被更新，会激活调度器中的其他函数，这些函数可能会使用在设置`cpu`字段之前更新的字段的值，所以要保证在更新`cpu`字段之前其他的字段更新已经完成。接下来关注`set_task_rq`函数。
 
 ##### `set_task_rq`函数
 
@@ -1012,7 +1012,7 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 }
 ```
 
-仅考虑`CONFIG_FAIR_GROUP_SCHED`宏启动的代码，这个宏表示CFS调度器调度的基本单位为进程组而非单个进程。这段代码更新了任务所在的rq、父`sched_entity`（`p->se.parent`）、深度（`se.depth`）三个字段，后两个字段的含义与开启了进程组调度之后进程的组织方式相关。当开启了进程组调度特性之后，调度器处理的任务按照层级结构关联起来，每个任务的`se.parent`字段指向任务所在组的`sched_entity`实例，`se.depth`字段的值为任务所在的层级。
+仅考虑`CONFIG_FAIR_GROUP_SCHED`宏启动的代码，这个宏表示CFS调度器调度的基本单位为进程组而非单个进程。这段代码更新了任务所在的运行队列、父`sched_entity`（`p->se.parent`）、深度（`se.depth`）三个字段，后两个字段的含义与开启了进程组调度之后进程的组织方式相关。当开启了进程组调度特性之后，调度器处理的任务按照层级结构关联起来，每个任务的`se.parent`字段指向任务所在组的`sched_entity`实例，`se.depth`字段的值为任务所在的层级。
 
 #### 2.5.唤醒任务
 
@@ -1050,7 +1050,7 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 }
 ```
 
-这个函数首先尝试将任务放入到wake list之中，若失败则更新rq的时间相关字段随后开始激活这个任务，更新rq的时间相关字段以及激活任务是在持有rq的锁的情况下进行的。这两个函数（`ttwu_queue_wakelist`、`update_rq_clock`）在前边提到过，接下来关注`ttwu_do_active`函数。
+这个函数首先尝试将任务放入到wake list之中，若失败则更新运行队列的时间相关字段随后开始激活这个任务，更新运行队列的时间相关字段以及激活任务是在持有运行队列的锁的情况下进行的。这两个函数（`ttwu_queue_wakelist`、`update_rq_clock`）在前边提到过，接下来关注`ttwu_do_active`函数。
 
 ##### `ttwu_do_active`函数
 
@@ -1081,7 +1081,7 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 }
 ```
 
-忽略`lockdep_assert_rq_held`函数以及当`p->iowait`为真时执行的代码，这个函数调用`activate_task`将任务加入到rq之中、调用`ttwu_do_wakeup`唤醒这个任务。同时若这个任务对系统负载有贡献，即这个任务会占用CPU资源，将rq中不可中断的计数器递减（`nr_uninterruptible`）。`ttwu_do_wakeup`函数的内容在前边已经提到，接下来关注`activate_task`函数的内容。
+忽略`lockdep_assert_rq_held`函数以及当`p->iowait`为真时执行的代码，这个函数调用`activate_task`将任务加入到运行队列之中、调用`ttwu_do_wakeup`唤醒这个任务。同时若这个任务对系统负载有贡献，即这个任务会占用CPU资源，将运行队列中不可中断的计数器递减（`nr_uninterruptible`）。`ttwu_do_wakeup`函数的内容在前边已经提到，接下来关注`activate_task`函数的内容。
 
 ##### `activate_task`函数
 
@@ -1097,4 +1097,4 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 }
 ```
 
-若这个任务在CPU中移动，则此时已经完成了移动，向`flags`中添加`ENQUEUE_MIGRATED`标识标记此种情况，随后调用`enqueue_task`将任务放入到rq之中，最后将任务设置为已经在rq中（`TASK_ON_RQ_QUEUED`）。
+若这个任务在CPU中移动，则此时已经完成了移动，向`flags`中添加`ENQUEUE_MIGRATED`标识标记此种情况，随后调用`enqueue_task`将任务放入到运行队列之中，最后将任务设置为已经在运行队列中（`TASK_ON_RQ_QUEUED`）。

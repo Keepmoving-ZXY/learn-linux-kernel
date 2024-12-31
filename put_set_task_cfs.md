@@ -1,4 +1,4 @@
-本文档记录`put_prev_task_fair`以及`set_next_task_fair`两个函数的详细流程，这两个函数是内核调度框架之中`put_prev_task`以及`set_next_task`方法的CFS实现。`put_prev_task`的作用是告诉调度类另外一个任务即将取代正在执行的任务，这个时候可以执行一些统计信息的更新；在任务在任务组或调度类之前转移时`set_next_task`设置调度类内部rq的正在运行的任务(`current`)并更新统计信息。
+本文档记录`put_prev_task_fair`以及`set_next_task_fair`两个函数的详细流程，这两个函数是内核调度框架之中`put_prev_task`以及`set_next_task`方法的CFS实现。`put_prev_task`的作用是告诉调度类另外一个任务即将取代正在执行的任务，这个时候可以执行一些统计信息的更新；在任务在任务组或调度类之前转移时`set_next_task`设置调度类内部运行队列的正在运行的任务(`current`)并更新统计信息。
 
 ### `put_prev_task_fair`函数
 

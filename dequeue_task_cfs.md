@@ -85,7 +85,7 @@ dequeue_throttle:
 
 这个函数调用了两次CFS运行队列以及任务组统计指标的更新函数，例如`update_load_avg`、`se_update_runnable`、`update_cfs_group`这三个函数，第一次调用是在第一个`for`循环中执行`dequeue_entity`的时候由`dequeue_entity`函数调用，第二次调用是在第二个`for`循环之中，同样的在`enqueue_task_fair`之中也出现了调用这三个函数两次的情况。这背后的原因主要涉及到两点：第一点是调度层次中当前层次的统计指标变化会影响上级的统计指标计算，在后边详细说明是如何影响的；第二点是调度层级的每一层之中`h_nr_running`、`idle_h_hr_running`要考虑所有下层之中可运行任务数量、可运行的空闲任务数量变化，作者把数量变化的传递放到了两个循环之中，可以结合`enqueue_task_fair`函数中的内容理解这一点。可以结合代码理解第一点，在遍历过程中每一层都会递减这一层实体`se`所在CFS运行队列中可运行任务统计(`h_nr_running`的值)，这个CFS运行队列是任务组在当前cpu上的运行队列，这一层实体的父实体`pse`就是任务组在当前cpu上的调度实体，当遍历到父实体时会更新父实体`pse`的`runnable_weight`为`se`所属CFS运行队列的可运行任务统计，这会进一步影响之后对`pse`执行`update_load_avg`时`load_avg`的计算。简而言之，把数量变化放到两个循环之中处理，每个循环之中当前遍历的实体所属CFS运行队列统计指标的变化会影响接下来遍历到的实体。
 
-这个函数最后的部分调用`sub_nr_running`将rq之中可运行任务的数量递减，因为前边两个`for`循环的作用让运行队列之中所有的任务都是空闲任务时(`!was_sched_idle && sched_idle_rq(rq)`为`True`)将对此运行队列进行下一次负载均衡的时机提前到现在(`rq->next_balance = jiffies`)，调用`update_hrtick`更新高精度定时器。
+这个函数最后的部分调用`sub_nr_running`将运行队列之中可运行任务的数量递减，因为前边两个`for`循环的作用让运行队列之中所有的任务都是空闲任务时(`!was_sched_idle && sched_idle_rq(rq)`为`True`)将对此运行队列进行下一次负载均衡的时机提前到现在(`rq->next_balance = jiffies`)，调用`update_hrtick`更新高精度定时器。
 
 以上的流程中提到的`update_load_avg`、`se_update_runnable`、`update_cfs_group`、`hrtick_update`函数流程详细记录见`enqueue_task_cfs.md`，`sched_idle_rq`、`dequeue_entity`、`sub_nr_running`函数流程在后边记录，其他函数忽略。
 
