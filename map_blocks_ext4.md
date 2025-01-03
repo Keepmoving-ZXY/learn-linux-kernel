@@ -325,8 +325,12 @@ B+树中的叶子节点保存了文件逻辑块地址与物理块的映射关系
 
 这部分内容对应于`path[depth].p_ext`不为空时执行的代码，代码之中`ee_block`为逻辑块的起始地址、`ee_start`为逻辑块对应的物理块的起始地址、`ee_len`为映射的逻辑块/物理块的个数，通过`in_range`函数确认`map`指定的逻辑块范围是否在寻找到的`extent`节点保存的逻辑块范围之内，只有当`map`指定的逻辑块范围在`extent`节点保存的逻辑块范围内时运行接下来的操作。
 
-`newblock`为`map`之中指定逻辑块起始地址对应的物理块起始地址，`allocated`初始化为`extent`节点`ex`之中在`map`指定的逻辑块起始地址之后的逻辑块数量。如果`ex`已经初始化并且设置了`EXT4_GET_BLOCKS_CONVERT_UNWRITTEN`，将`ex`重置为未初始化状态，随后跳转到标签`out`处执行，将一个`extent`节点重置成未初始化状态由`convert_initialized_extent`函数实现；如果`ex`已经初始化并且没有设置`EXT4_GET_BLOCKS_CONVERT_UNWRITTEN`，将查找到的物理块起始地址、映射的物理块个数写入到`map`之中，跳转到标签`out`处继续执行；若没有命中以上两种情况则意味着找到的`ex`还没有初始化，此时调用`ext4_ext_handle_unwritten_extents`对`ex`进行初始化，跳转到标签`out`处继续执行。
+`newblock`为`map`之中指定逻辑块起始地址对应的物理块起始地址，`allocated`初始化为`extent`节点`ex`之中在`map`指定的逻辑块起始地址之后的逻辑块数量。如果`ex`已经初始化并且允许将`extent`节点转换为未初始化状态，将`ex`重置为未初始化状态，随后跳转到标签`out`处执行，将一个`extent`节点重置成未初始化状态由`convert_initialized_extent`函数实现；如果`ex`已经初始化并且不允许将`extent`节点转换为未初始化状态，将查找到的物理块起始地址、映射的物理块个数写入到`map`之中，跳转到标签`out`处继续执行；若没有命中以上两种情况则意味着找到的`ex`还没有初始化，调用`ext4_ext_handle_unwritten_extents`对`ex`进行初始化，跳转到标签`out`处继续执行。
 
-#### 未分配对应的物理块
+#### 未找到对应的物理块
 
-这部分内容对应代码之中`if ((flags & EXT4_GET_BLOCKS_CREATE) == 0) {}`到标签`out`之间的代码。
+这部分内容对应代码之中`if ((flags & EXT4_GET_BLOCKS_CREATE) == 0) {}`到标签`out`之间的代码，这部分内容对应未找到`map`之中指定逻辑块对应的物理块还未分配的情况。此时若不允许分配新的物理块，调用`ext4_ext_determine_insert_hole`函数确定还有多少物理块需要分配，因为有一些逻辑块已经分配了对应了的物理块，需要计算还有多少物理块需要分配而不是直接返回`map`之中需要指定的物理块个数，将还需要分配的物理块保存到`map`之中跳转到标签`out`处继续执行。
+
+在`ext4`文件系统之中一个`cluster`由多个连续的块组成，当允许分配新的物理块时先检查`map`之中指定的逻辑块是否包含在一个`cluster`之中，这个判断由`get_implied_cluster_alloc`函数完成，当`map`之中指定的逻辑块包含在了一个`cluster`之中意味着已经为逻辑块分配了对应的物理块，跳转到标签`got_allocated_blocks`处继续执行。
+
+当一个`cluster`之中的块无法满足需求，需要考虑分配新的物理块。
