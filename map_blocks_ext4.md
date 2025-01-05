@@ -338,3 +338,7 @@ B+树中的叶子节点保存了文件逻辑块地址与物理块的映射关系
 #### 标签`got_allocated_blocks`
 
 这部分内容对应代码中标签`got_allocated_blocks`中的代码，`newex`保存新创建的`extent`的内容，主要的流程为：1).向`newex`之中填入物理块起始地址(`ext4_ext_store_pblock`函数)、分配的物理块数量，若需要将其设置为未初始化状态则调用`ext4_ext_mark_unwritten`函数进行转换；2).将新创建的`extent`插入到B+树之中，对应的函数是`ext4_ext_insert_extent`，若插入失败丢弃已经预分配的物理块(`ext4_discard_preallocations`函数)、释放已经分配的物理块(`ext4_free_blocks`函数)、跳转到`out`处继续执行；3).在启用了延迟分配并且之前的流程中分配了新的`cluster`时调用`ext4_da_update_reserve_space`函数更新延迟分配机制中保留的`cluster`计数，其他情况下调用`ext4_es_delayed_clu`确认是否有延迟分配的`cluster`，若存在调用`ext4_da_update_reserve_space`更新保留`cluster`的计数。这里涉及到了`ext4`文件系统的延迟分配功能，这个功能实现当IO数据从缓存写入到磁盘之中时才会分配物理块而非在数据写入文件时立刻分配物理块，`ext4`文件系统之中会记录为延迟分配保留的`cluster`数量；4).更新inode同步事务，涉及到的函数为`ext4_update_inode_fsync_trans`；5).填充映射结果至`map`之中，其中`m_pblk`保存逻辑块映射的物理块起始地址、`m_len`保存映射的物理块数量。
+
+#### 标签`out`
+
+这部分内容对应代码之中标签`out`处的代码，这部分内容释放`ext4_find_extent`函数分配的资源，即调用`ext4_free_ext_path`函数释放`path`指向的结构，根据分配过程中是否发生错误确定返回值：若发生错误返回错误对应的错误代码(存储在`err`之中)，若未发生错误返回建立与逻辑块映射所需物理块数量。
