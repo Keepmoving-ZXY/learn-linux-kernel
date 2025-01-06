@@ -342,3 +342,98 @@ B+树中的叶子节点保存了文件逻辑块地址与物理块的映射关系
 #### 标签`out`
 
 这部分内容对应代码之中标签`out`处的代码，这部分内容释放`ext4_find_extent`函数分配的资源，即调用`ext4_free_ext_path`函数释放`path`指向的结构，根据分配过程中是否发生错误确定返回值：若发生错误返回错误对应的错误代码(存储在`err`之中)，若未发生错误返回建立与逻辑块映射所需物理块数量。
+
+### `ext4_find_extent`函数
+
+```c
+struct ext4_ext_path *
+ext4_find_extent(struct inode *inode, ext4_lblk_t block,
+		 struct ext4_ext_path **orig_path, int flags)
+{
+	struct ext4_extent_header *eh;
+	struct buffer_head *bh;
+	struct ext4_ext_path *path = orig_path ? *orig_path : NULL;
+	short int depth, i, ppos = 0;
+	int ret;
+	gfp_t gfp_flags = GFP_NOFS;
+
+	if (flags & EXT4_EX_NOFAIL)
+		gfp_flags |= __GFP_NOFAIL;
+
+	eh = ext_inode_hdr(inode);
+	depth = ext_depth(inode);
+	if (depth < 0 || depth > EXT4_MAX_EXTENT_DEPTH) {
+		EXT4_ERROR_INODE(inode, "inode has invalid extent depth: %d",
+				 depth);
+		ret = -EFSCORRUPTED;
+		goto err;
+	}
+
+	if (path) {
+		ext4_ext_drop_refs(path);
+		if (depth > path[0].p_maxdepth) {
+			kfree(path);
+			*orig_path = path = NULL;
+		}
+	}
+	if (!path) {
+		/* account possible depth increase */
+		path = kcalloc(depth + 2, sizeof(struct ext4_ext_path),
+				gfp_flags);
+		if (unlikely(!path))
+			return ERR_PTR(-ENOMEM);
+		path[0].p_maxdepth = depth + 1;
+	}
+	path[0].p_hdr = eh;
+	path[0].p_bh = NULL;
+
+	i = depth;
+	if (!(flags & EXT4_EX_NOCACHE) && depth == 0)
+		ext4_cache_extents(inode, eh);
+	/* walk through the tree */
+	while (i) {
+		ext_debug(inode, "depth %d: num %d, max %d\n",
+			  ppos, le16_to_cpu(eh->eh_entries), le16_to_cpu(eh->eh_max));
+
+		ext4_ext_binsearch_idx(inode, path + ppos, block);
+		path[ppos].p_block = ext4_idx_pblock(path[ppos].p_idx);
+		path[ppos].p_depth = i;
+		path[ppos].p_ext = NULL;
+
+		bh = read_extent_tree_block(inode, path[ppos].p_idx, --i, flags);
+		if (IS_ERR(bh)) {
+			ret = PTR_ERR(bh);
+			goto err;
+		}
+
+		eh = ext_block_hdr(bh);
+		ppos++;
+		path[ppos].p_bh = bh;
+		path[ppos].p_hdr = eh;
+	}
+
+	path[ppos].p_depth = i;
+	path[ppos].p_ext = NULL;
+	path[ppos].p_idx = NULL;
+
+	/* find extent */
+	ext4_ext_binsearch(inode, path + ppos, block);
+	/* if not an empty leaf */
+	if (path[ppos].p_ext)
+		path[ppos].p_block = ext4_ext_pblock(path[ppos].p_ext);
+
+	ext4_ext_show_path(inode, path);
+
+	if (orig_path)
+		*orig_path = path;
+	return path;
+
+err:
+	ext4_free_ext_path(path);
+	if (orig_path)
+		*orig_path = NULL;
+	return ERR_PTR(ret);
+}
+```
+
+这个函数用于寻找B+树中与参数`block`指定的逻辑块最近的`extent`，即B+树中某个`extent`之中映射的逻辑块起始地址与`block`给定的逻辑块起始地址最接近，具体流程为：1).B+树深度检测，`depth`为B+树的深度，在开始搜索之前对B+树深度进行校验：若`depth`小于0或者大于B+树最大的深度跳转到标签`out`处执行；2).已经存在的`struct ext4_ext_path`实例处理，  `struct ext4_ext_path`结构存储查找结果之中B+树每一层的索引节点或者叶子节点内容，`path`可能指向一个已经存在的实例，这个实例是之前某次搜索B+树时创建的，这种情况下调用`ext4_ext_drop_refs`函数释放B+树每一层的索引节点或者叶子节点占用的缓冲区，若之前搜索的B+树深度小于马上搜索的B+树的深度意味着这个实例无法容纳新的B+树中搜索结果，释放这个实例；
