@@ -313,7 +313,7 @@ out:
 }
 ```
 
-函数参数之中`inode`用于描述文件系统之中文件或者目录的位置以及属性等信息，`map`之中保存查找的逻辑块范围、映射建立之后逻辑块对应的物理块范围等信息，代码之中`struct ext4_extent`类型实例保持了逻辑块范围与物理块范围的映射关系。`ext4`文件系统之中使用B+树来保存物理块与逻辑块的映射关系，这个函数以及被调用的函数中许多内容都涉及到了B+树的操作，B+树中的每个节点由一个`struct ext4_extent_header`的实例以及多个`struct ext4_extent_idx`实例或者`struct ext4_extent`实例组成，`struct ext4_extent_header`实例叫做节点头：当一个节点中由一个节点头以及多个`struct ext4_extent_idx`实例组成时这个节点叫做索引节点，一个`struct ext4_extent_idx`实例叫做索引；当一个节点由一个节点头以及多个`struct ext4_extent`实例组成时这个节点叫做`extent`节点，一个`struct ext4_extent`叫做`extent`。B+树中索引节点保存接下来应该查找哪些节点，`extent`节点中保存逻辑块与物理块的映射关系。
+函数参数之中`inode`用于描述文件系统之中文件或者目录的位置以及属性等信息，`map`之中保存查找的逻辑块范围、映射建立之后逻辑块对应的物理块范围等信息，代码之中`struct ext4_extent`类型实例保持了逻辑块范围与物理块范围的映射关系。`ext4`文件系统之中使用B+树来保存物理块与逻辑块的映射关系，这个函数以及被调用的函数中许多内容都涉及到了B+树的操作，B+树中的每个节点由一个`struct ext4_extent_header`的实例以及多个`struct ext4_extent_idx`实例或者`struct ext4_extent`实例组成，`struct ext4_extent_header`实例叫做节点头：当一个节点中由一个节点头以及多个`struct ext4_extent_idx`实例组成时这个节点叫做索引节点，一个`struct ext4_extent_idx`实例叫做索引，一个索引之中保存一个逻辑块与下一层节点的映射；当一个节点由一个节点头以及多个`struct ext4_extent`实例组成时这个节点叫做`extent`节点，一个`struct ext4_extent`叫做`extent`。B+树中索引节点保存接下来应该查找哪些节点，`extent`节点中保存逻辑块与物理块的映射关系。
 
 #### B+树中搜索
 
@@ -436,4 +436,73 @@ err:
 }
 ```
 
-这个函数用于寻找B+树中与参数`block`指定的逻辑块最近的`extent`，即B+树中某个`extent`之中映射的逻辑块起始地址与`block`给定的逻辑块起始地址最接近，具体流程为：1).B+树深度检测，`depth`为B+树的深度，在开始搜索之前对B+树深度进行校验：若`depth`小于0或者大于B+树最大的深度跳转到标签`out`处执行；2).已经存在的`struct ext4_ext_path`数组处理，  `struct ext4_ext_path`结构存储查找结果之中B+树每一层的索引节点或者叶子节点内容，`path`可能指向一个已经存在的数组，这个实例是之前某次搜索B+树时创建的，这种情况下调用`ext4_ext_drop_refs`函数释放B+树每一层的索引节点或者叶子节点占用的缓冲区，若之前搜索的B+树深度小于马上搜索的B+树的深度意味着这个实例无法容纳新的B+树中搜索结果，释放这个数组；3).创建新的`struct ext4_ext_path`数组，当在之前的流程中传入的数组被释放或者没有传入数组的时候会创建新的数组，数组之中保存遍历到的B+树每一层的索引或者叶子节点，因此数组的长度要大于B+树的深度；4).初始化`struct ext4_ext_path`数组，数组中第一个位置存储B+树根节点的节点头，当B+树只有一个根节点时调用`ext_cache_extents`将B+树的状态保存到`extent`状态树中。
+这个函数用于寻找B+树中与参数`block`指定的逻辑块最近的`extent`，即B+树中某个`extent`之中映射的逻辑块起始地址与`block`给定的逻辑块起始地址最接近，具体流程为：1).B+树深度检测，`depth`为B+树的深度，在开始搜索之前对B+树深度进行校验：若`depth`小于0或者大于B+树最大的深度跳转到标签`out`处执行；2).已经存在的`struct ext4_ext_path`数组处理，  `struct ext4_ext_path`结构存储查找结果之中B+树每一层的索引节点或者叶子节点内容，`path`可能指向一个已经存在的数组，这个实例是之前某次搜索B+树时创建的，这种情况下调用`ext4_ext_drop_refs`函数释放B+树每一层的索引节点或者叶子节点占用的缓冲区，若之前搜索的B+树深度小于马上搜索的B+树的深度意味着这个实例无法容纳新的B+树中搜索结果，释放这个数组；3).创建新的`struct ext4_ext_path`数组，当在之前的流程中传入的数组被释放或者没有传入数组的时候会创建新的数组，数组之中保存遍历到的B+树每一层的索引或者叶子节点，因此数组的长度要大于B+树的深度；4).初始化`struct ext4_ext_path`数组，数组中第一个位置存储B+树根节点的节点头，当B+树只有一个根节点时调用`ext_cache_extents`将B+树的状态保存到`extent`状态树中；5).逐层搜索B+树至倒数第二层，对于B+树的每一层调用`ext4_ext_binsearch_idx`函数使用二分查找这一层中在多个索引之中找到一个索引(这个索引之中保存的逻辑块是最小并且包含待查找逻辑块起始地址)、在`struct ext4_ext_path`数组之中当前层对应的位置保存这一层中找到的索引以及索引所在的节点头；6).搜索B+树最后一层，这层之中的节点中存储的都是`extent`，调用`ext4_ext_binsearch`从这一层之中查找符合要求的`extent`并写入到`struct ext4_ext_path`数组之中的最后一个位置，符合要求的`extent`为保存的逻辑块之中包含了待查找的逻辑块起始地址的`extent`，返回`struct ext4_ext_path`数组。标签`out`处的代码释放已经分配的`struct ext4_ext_path`数组，返回错误代码。
+
+### `ext4_ext_determine_insert_hole`函数
+
+```c
+/*
+ * Determine hole length around the given logical block, first try to
+ * locate and expand the hole from the given @path, and then adjust it
+ * if it's partially or completely converted to delayed extents, insert
+ * it into the extent cache tree if it's indeed a hole, finally return
+ * the length of the determined extent.
+ */
+static ext4_lblk_t ext4_ext_determine_insert_hole(struct inode *inode,
+						  struct ext4_ext_path *path,
+						  ext4_lblk_t lblk)
+{
+	ext4_lblk_t hole_start, len;
+	struct extent_status es;
+
+	hole_start = lblk;
+	len = ext4_ext_find_hole(inode, path, &hole_start);
+again:
+	ext4_es_find_extent_range(inode, &ext4_es_is_delayed, hole_start,
+				  hole_start + len - 1, &es);
+	if (!es.es_len)
+		goto insert_hole;
+
+	/*
+	 * There's a delalloc extent in the hole, handle it if the delalloc
+	 * extent is in front of, behind and straddle the queried range.
+	 */
+	if (lblk >= es.es_lblk + es.es_len) {
+		/*
+		 * The delalloc extent is in front of the queried range,
+		 * find again from the queried start block.
+		 */
+		len -= lblk - hole_start;
+		hole_start = lblk;
+		goto again;
+	} else if (in_range(lblk, es.es_lblk, es.es_len)) {
+		/*
+		 * The delalloc extent containing lblk, it must have been
+		 * added after ext4_map_blocks() checked the extent status
+		 * tree, adjust the length to the delalloc extent's after
+		 * lblk.
+		 */
+		len = es.es_lblk + es.es_len - lblk;
+		return len;
+	} else {
+		/*
+		 * The delalloc extent is partially or completely behind
+		 * the queried range, update hole length until the
+		 * beginning of the delalloc extent.
+		 */
+		len = min(es.es_lblk - hole_start, len);
+	}
+
+insert_hole:
+	/* Put just found gap into cache to speed up subsequent requests */
+	ext_debug(inode, " -> %u:%u\n", hole_start, len);
+	ext4_es_insert_extent(inode, hole_start, len, ~0, EXTENT_STATUS_HOLE);
+
+	/* Update hole_len to reflect hole size after lblk */
+	if (hole_start != lblk)
+		len -= lblk - hole_start;
+
+	return len;
+}
+```
+
