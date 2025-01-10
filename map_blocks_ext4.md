@@ -313,7 +313,7 @@ out:
 }
 ```
 
-函数参数之中`inode`用于描述文件系统之中文件或者目录的位置以及属性等信息，`map`之中保存查找的逻辑块范围、映射建立之后逻辑块对应的物理块范围等信息，代码之中`struct ext4_extent`类型实例保持了逻辑块范围与物理块范围的映射关系。`ext4`文件系统之中使用B+树来保存物理块与逻辑块的映射关系，这个函数以及被调用的函数中许多内容都涉及到了B+树的操作，B+树中的每个节点由一个`struct ext4_extent_header`的实例以及多个`struct ext4_extent_idx`实例或者`struct ext4_extent`实例组成，`struct ext4_extent_header`实例叫做节点头：当一个节点中由一个节点头以及多个`struct ext4_extent_idx`实例组成时这个节点叫做索引节点，一个`struct ext4_extent_idx`实例叫做索引，一个索引之中保存一个逻辑块与下一层节点的映射；当一个节点由一个节点头以及多个`struct ext4_extent`实例组成时这个节点叫做`extent`节点，一个`struct ext4_extent`叫做`extent`。B+树中索引节点保存接下来应该查找哪些节点，`extent`节点中保存逻辑块与物理块的映射关系。
+函数参数之中`inode`用于描述文件系统之中文件或者目录的位置以及属性等信息，`map`之中保存查找的逻辑块范围、映射建立之后逻辑块对应的物理块范围等信息，代码之中`struct ext4_extent`类型实例保持了逻辑块范围与物理块范围的映射关系。`ext4`文件系统之中使用B+树来保存物理块与逻辑块的映射关系，这个函数以及被调用的函数中许多内容都涉及到了B+树的操作，B+树中的每个节点由一个`struct ext4_extent_header`的实例以及多个`struct ext4_extent_idx`实例或者`struct ext4_extent`实例组成，`struct ext4_extent_header`实例叫做节点头：当一个节点中由一个节点头以及多个`struct ext4_extent_idx`实例组成时这个节点叫做索引节点，一个`struct ext4_extent_idx`实例叫做索引，一个索引之中保存一个逻辑块与下一层节点的映射；当一个节点由一个节点头以及多个`struct ext4_extent`实例组成时这个节点叫做`extent`节点，一个`struct ext4_extent`实例叫做`extent`。B+树中索引节点保存接下来应该查找哪些节点，`extent`节点中保存逻辑块与物理块的映射关系。
 
 #### B+树中搜索
 
@@ -436,7 +436,21 @@ err:
 }
 ```
 
-这个函数用于寻找B+树中与参数`block`指定的逻辑块最近的`extent`，即B+树中某个`extent`之中映射的逻辑块起始地址与`block`给定的逻辑块起始地址最接近，具体流程为：1).B+树深度检测，`depth`为B+树的深度，在开始搜索之前对B+树深度进行校验：若`depth`小于0或者大于B+树最大的深度跳转到标签`out`处执行；2).已经存在的`struct ext4_ext_path`数组处理，  `struct ext4_ext_path`结构存储查找结果之中B+树每一层的索引节点或者叶子节点内容，`path`可能指向一个已经存在的数组，这个实例是之前某次搜索B+树时创建的，这种情况下调用`ext4_ext_drop_refs`函数释放B+树每一层的索引节点或者叶子节点占用的缓冲区，若之前搜索的B+树深度小于马上搜索的B+树的深度意味着这个实例无法容纳新的B+树中搜索结果，释放这个数组；3).创建新的`struct ext4_ext_path`数组，当在之前的流程中传入的数组被释放或者没有传入数组的时候会创建新的数组，数组之中保存遍历到的B+树每一层的索引或者叶子节点，因此数组的长度要大于B+树的深度；4).初始化`struct ext4_ext_path`数组，数组中第一个位置存储B+树根节点的节点头，当B+树只有一个根节点时调用`ext_cache_extents`将B+树的状态保存到`extent`状态树中；5).逐层搜索B+树至倒数第二层，对于B+树的每一层调用`ext4_ext_binsearch_idx`函数使用二分查找这一层中在多个索引之中找到一个索引(这个索引之中保存的逻辑块是最小并且包含待查找逻辑块起始地址)、在`struct ext4_ext_path`数组之中当前层对应的位置保存这一层中找到的索引以及索引所在的节点头；6).搜索B+树最后一层，这层之中的节点中存储的都是`extent`，调用`ext4_ext_binsearch`从这一层之中查找符合要求的`extent`并写入到`struct ext4_ext_path`数组之中的最后一个位置，符合要求的`extent`为保存的逻辑块之中最接近待查找的逻辑块起始地址的`extent`，返回`struct ext4_ext_path`数组。标签`out`处的代码释放已经分配的`struct ext4_ext_path`数组，返回错误代码。
+这个函数用于寻找B+树中与参数`block`指定的逻辑块最近的`extent`，即B+树中某个`extent`之中映射的逻辑块起始地址与`block`给定的逻辑块起始地址最接近，具体流程如下：
+
+1).B+树深度检测，`depth`为B+树的深度，在开始搜索之前对B+树深度进行校验：若`depth`小于0或者大于B+树最大的深度跳转到标签`out`处执行；
+
+2).已经存在的`struct ext4_ext_path`数组处理，  `struct ext4_ext_path`结构存储查找结果之中B+树每一层的索引节点或者叶子节点内容，`path`可能指向一个已经存在的数组，这个实例是之前某次搜索B+树时创建的，这种情况下调用`ext4_ext_drop_refs`函数释放B+树每一层的索引节点或者叶子节点占用的缓冲区，若之前搜索的B+树深度小于马上搜索的B+树的深度意味着这个实例无法容纳新的B+树中搜索结果，释放这个数组；
+
+3).创建新的`struct ext4_ext_path`数组，当在之前的流程中传入的数组被释放或者没有传入数组的时候会创建新的数组，数组之中保存遍历到的B+树每一层的索引或者叶子节点，因此数组的长度要大于B+树的深度；
+
+4).初始化`struct ext4_ext_path`数组，数组中第一个位置存储B+树根节点的节点头，当B+树只有一个根节点时调用`ext_cache_extents`将B+树的状态保存到`extent`状态树中；
+
+5).逐层搜索B+树至倒数第二层，对于B+树的每一层调用`ext4_ext_binsearch_idx`函数使用二分查找这一层中在多个索引之中找到一个索引(这个索引之中保存的逻辑块是最小并且包含待查找逻辑块起始地址)、在`struct ext4_ext_path`数组之中当前层对应的位置保存这一层中找到的索引以及索引所在的节点头；
+
+6).搜索B+树最后一层，这层之中的节点中存储的都是`extent`，调用`ext4_ext_binsearch`从这一层之中查找符合要求的`extent`并写入到`struct ext4_ext_path`数组之中的最后一个位置，符合要求的`extent`为保存的逻辑块之中最接近待查找的逻辑块起始地址的`extent`，返回`struct ext4_ext_path`数组。
+
+7).标签`out`处的代码释放已经分配的`struct ext4_ext_path`数组，返回错误代码。
 
 ### `ext4_ext_determine_insert_hole`函数
 
@@ -525,3 +539,113 @@ insert_hole:
 5).标签`insert_hole`之中的代码将空洞插入到状态树之中，计算空洞之中位于给定逻辑块(单个块)之后的逻辑块数量并返回；
 
 这个函数的返回值为已经预留的逻辑块长度，预留的逻辑块可能是空洞之中给定逻辑块(单个块)后边的部分，也可能是延迟分配的逻辑块之中给定逻辑块(单个块)后边的部分。
+
+### `get_implied_cluster_alloc`函数
+
+```c
+/*
+ * get_implied_cluster_alloc - check to see if the requested
+ * allocation (in the map structure) overlaps with a cluster already
+ * allocated in an extent.
+ *	@sb	The filesystem superblock structure
+ *	@map	The requested lblk->pblk mapping
+ *	@ex	The extent structure which might contain an implied
+ *			cluster allocation
+ *
+ * This function is called by ext4_ext_map_blocks() after we failed to
+ * find blocks that were already in the inode's extent tree.  Hence,
+ * we know that the beginning of the requested region cannot overlap
+ * the extent from the inode's extent tree.  There are three cases we
+ * want to catch.  The first is this case:
+ *
+ *		 |--- cluster # N--|
+ *    |--- extent ---|	|---- requested region ---|
+ *			|==========|
+ *
+ * The second case that we need to test for is this one:
+ *
+ *   |--------- cluster # N ----------------|
+ *	   |--- requested region --|   |------- extent ----|
+ *	   |=======================|
+ *
+ * The third case is when the requested region lies between two extents
+ * within the same cluster:
+ *          |------------- cluster # N-------------|
+ * |----- ex -----|                  |---- ex_right ----|
+ *                  |------ requested region ------|
+ *                  |================|
+ *
+ * In each of the above cases, we need to set the map->m_pblk and
+ * map->m_len so it corresponds to the return the extent labelled as
+ * "|====|" from cluster #N, since it is already in use for data in
+ * cluster EXT4_B2C(sbi, map->m_lblk).	We will then return 1 to
+ * signal to ext4_ext_map_blocks() that map->m_pblk should be treated
+ * as a new "allocated" block region.  Otherwise, we will return 0 and
+ * ext4_ext_map_blocks() will then allocate one or more new clusters
+ * by calling ext4_mb_new_blocks().
+ */
+static int get_implied_cluster_alloc(struct super_block *sb,
+				     struct ext4_map_blocks *map,
+				     struct ext4_extent *ex,
+				     struct ext4_ext_path *path)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	ext4_lblk_t c_offset = EXT4_LBLK_COFF(sbi, map->m_lblk);
+	ext4_lblk_t ex_cluster_start, ex_cluster_end;
+	ext4_lblk_t rr_cluster_start;
+	ext4_lblk_t ee_block = le32_to_cpu(ex->ee_block);
+	ext4_fsblk_t ee_start = ext4_ext_pblock(ex);
+	unsigned short ee_len = ext4_ext_get_actual_len(ex);
+
+	/* The extent passed in that we are trying to match */
+	ex_cluster_start = EXT4_B2C(sbi, ee_block);
+	ex_cluster_end = EXT4_B2C(sbi, ee_block + ee_len - 1);
+
+	/* The requested region passed into ext4_map_blocks() */
+	rr_cluster_start = EXT4_B2C(sbi, map->m_lblk);
+
+	if ((rr_cluster_start == ex_cluster_end) ||
+	    (rr_cluster_start == ex_cluster_start)) {
+		if (rr_cluster_start == ex_cluster_end)
+			ee_start += ee_len - 1;
+		map->m_pblk = EXT4_PBLK_CMASK(sbi, ee_start) + c_offset;
+		map->m_len = min(map->m_len,
+				 (unsigned) sbi->s_cluster_ratio - c_offset);
+		/*
+		 * Check for and handle this case:
+		 *
+		 *   |--------- cluster # N-------------|
+		 *		       |------- extent ----|
+		 *	   |--- requested region ---|
+		 *	   |===========|
+		 */
+
+		if (map->m_lblk < ee_block)
+			map->m_len = min(map->m_len, ee_block - map->m_lblk);
+
+		/*
+		 * Check for the case where there is already another allocated
+		 * block to the right of 'ex' but before the end of the cluster.
+		 *
+		 *          |------------- cluster # N-------------|
+		 * |----- ex -----|                  |---- ex_right ----|
+		 *                  |------ requested region ------|
+		 *                  |================|
+		 */
+		if (map->m_lblk > ee_block) {
+			ext4_lblk_t next = ext4_ext_next_allocated_block(path);
+			map->m_len = min(map->m_len, next - map->m_lblk);
+		}
+
+		trace_ext4_get_implied_cluster_alloc_exit(sb, map, 1);
+		return 1;
+	}
+
+	trace_ext4_get_implied_cluster_alloc_exit(sb, map, 0);
+	return 0;
+}
+```
+
+这个函数确定`map`给定的逻辑块是否与某个已经分配的`cluster`有重叠，这个函数返回1时意味着`map`返回的逻辑块为`cluster`之中未被占用的逻辑块、返回0意味着需要分配新的`cluster`以满足`map`之中给定的逻辑块分配请求，`ee_block`、`ee_start`、`ee_len`为给定`extent`之中保存的逻辑块起始地址、物理块起始地址、物理块的长度(同时也是逻辑块的长度)，`rr_cluster_start`为`map`之中给定逻辑块所在的`cluster`，`ex`给定的`extent`之中保存的逻辑块可能会跨越多个`cluster`，`ex_cluster_start`为`ex`给定的`extent`之中逻辑块起始地址所在的`cluster`、`ex_cluster_end`为`ex`给定的`extent`之中逻辑块结束地址所在的`cluster`。`rr_cluster_start`与`ex_cluster_start`相同意味着`map`之中给定逻辑块起始地址与`ex`给定的`extent`之中保存的逻辑块起始地址属于同一个`cluster`，考虑到运行此函数的时候两个逻辑块没有重叠，可以推断出`map`之中给定逻辑块位于`ex`给定的`extent`之中保存逻辑块之前；`rr_cluster_start`与`ex_cluster_end`相同意味着`map`之中给定逻辑块起始地址与`ex`给定的`extent`之中保存的逻辑块结束地址属于同一个`cluster`，考虑到运行此函数的时候两个逻辑块没有重叠，可以推断出`map`之中给定逻辑块位于`ex`给定的`extent`之中保存的逻辑块之后。当`map`之中给定逻辑块没有与`ex`给定的`extent`在同一个`cluster`中时，返回0表明需要分配新的`cluster`。
+
+当`map`之中给定逻辑块与`ex`给定的`extent`在同一个`cluster`之中时，函数的逻辑主要集中在`map`之中保存的物理块起始地址(`m_pblk`字段)以及物理块长度(`m_len`)的设置上，这两个值确定了`cluster`之中一个未被占用的物理块，返回1表示出现此种情况。`map`之中物理块起始地址需要考虑两种情况：当`map`之中给定的逻辑块在`ex`给定的`extent`中保存的逻辑块之后时，`map`之中给定的逻辑块部分或全部在`ex`给定的`extent`之中保存逻辑块占用的最后一个`cluster`之中，这个`cluster`的起始物理块地址加上`map`之中给定逻辑块在`cluster`之中的偏移得到了`map`之中给定逻辑块起始地址映射的物理块起始地址，这段逻辑对应的代码之中`ee_start`增加了`len-1`之后成为`ex`给定的`extent`之中保存的物理块中最后一个块的地址、`EXT4_PBLK_CMASK(sbi, ee_start)`为`ex`给定的`extent`之中保存逻辑块占用的最后一个`cluster`、`c_offset`为`map`之中给定的逻辑块起始地址在`cluster`之中的偏移；当`map`之中给定逻辑块在`ex`给定的`extent`中保存的逻辑块之前时，`map`之中给定的逻辑块部分或全部在`ex`给定的`extent`之中国保存逻辑块占用的第一个`cluster`之中，这个`cluster`的起始物理块地址加上`map`之中给定逻辑块在`cluster`之中的偏移得到了`map`之中给定逻辑块起始地址映射的物理块起始地址，这段逻辑对应的代码之中`ee_start`为`ex`给定的`extent`之中保持物理块的起始地址、`EXT4_PBLK_CMASK(sbi, ee_start)`为`ex`给定的`extent`之中保存逻辑块占用的第一个`cluster`，`c_offset`为`map`之中给定的逻辑块起始地址在`cluster`之中的偏移。`map`之中物理块长度保证物理块(由`map`之中物理块起始地址与长度确定)不会越过所在的`cluster`，代码之中使用`min(map->m_len, (unsigned) sbi->s_cluster_ratio - c_offset)`来保证这一点，接下来根据`map`之中保存的逻辑块起始地址、`ex`给定的`extent`之中保存的逻辑块起始地址的关系进一步调整`map`之中保存的物理块长度以保证`map`中保存的物理块未被占用：当`map`中给定的逻辑块起始地址小于`ex`给定的`extent`之中保存的逻辑块起始地址时，确保`map`之中保存的物理块长度最多为`cluster`之中这两个逻辑块起始地址对应的物理块(单个块)之间的的物理块个数；反之获取`ex`给定的`extent`之后的`extent`，`map`中给定的逻辑块起始地址与之后的`ex`给定的`extent`中保存的起始地址之间的物理块未被占用，确保`map`之中保存的物理块长度最多为这两个逻辑块起始地址对应的物理块(单个块)之间的物理块个数。
