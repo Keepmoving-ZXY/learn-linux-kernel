@@ -649,3 +649,200 @@ static int get_implied_cluster_alloc(struct super_block *sb,
 这个函数确定`map`给定的逻辑块是否与某个已经分配的`cluster`有重叠，这个函数返回1时意味着`map`返回的逻辑块为`cluster`之中未被占用的逻辑块、返回0意味着需要分配新的`cluster`以满足`map`之中给定的逻辑块分配请求，`ee_block`、`ee_start`、`ee_len`为给定`extent`之中保存的逻辑块起始地址、物理块起始地址、物理块的长度(同时也是逻辑块的长度)，`rr_cluster_start`为`map`之中给定逻辑块所在的`cluster`，`ex`给定的`extent`之中保存的逻辑块可能会跨越多个`cluster`，`ex_cluster_start`为`ex`给定的`extent`之中逻辑块起始地址所在的`cluster`、`ex_cluster_end`为`ex`给定的`extent`之中逻辑块结束地址所在的`cluster`。`rr_cluster_start`与`ex_cluster_start`相同意味着`map`之中给定逻辑块起始地址与`ex`给定的`extent`之中保存的逻辑块起始地址属于同一个`cluster`，考虑到运行此函数的时候两个逻辑块没有重叠，可以推断出`map`之中给定逻辑块位于`ex`给定的`extent`之中保存逻辑块之前；`rr_cluster_start`与`ex_cluster_end`相同意味着`map`之中给定逻辑块起始地址与`ex`给定的`extent`之中保存的逻辑块结束地址属于同一个`cluster`，考虑到运行此函数的时候两个逻辑块没有重叠，可以推断出`map`之中给定逻辑块位于`ex`给定的`extent`之中保存的逻辑块之后。当`map`之中给定逻辑块没有与`ex`给定的`extent`在同一个`cluster`中时，返回0表明需要分配新的`cluster`。
 
 当`map`之中给定逻辑块与`ex`给定的`extent`在同一个`cluster`之中时，函数的逻辑主要集中在`map`之中保存的物理块起始地址(`m_pblk`字段)以及物理块长度(`m_len`)的设置上，这两个值确定了`cluster`之中一个未被占用的物理块，返回1表示出现此种情况。`map`之中物理块起始地址需要考虑两种情况：当`map`之中给定的逻辑块在`ex`给定的`extent`中保存的逻辑块之后时，`map`之中给定的逻辑块部分或全部在`ex`给定的`extent`之中保存逻辑块占用的最后一个`cluster`之中，这个`cluster`的起始物理块地址加上`map`之中给定逻辑块在`cluster`之中的偏移得到了`map`之中给定逻辑块起始地址映射的物理块起始地址，这段逻辑对应的代码之中`ee_start`增加了`len-1`之后成为`ex`给定的`extent`之中保存的物理块中最后一个块的地址、`EXT4_PBLK_CMASK(sbi, ee_start)`为`ex`给定的`extent`之中保存逻辑块占用的最后一个`cluster`、`c_offset`为`map`之中给定的逻辑块起始地址在`cluster`之中的偏移；当`map`之中给定逻辑块在`ex`给定的`extent`中保存的逻辑块之前时，`map`之中给定的逻辑块部分或全部在`ex`给定的`extent`之中国保存逻辑块占用的第一个`cluster`之中，这个`cluster`的起始物理块地址加上`map`之中给定逻辑块在`cluster`之中的偏移得到了`map`之中给定逻辑块起始地址映射的物理块起始地址，这段逻辑对应的代码之中`ee_start`为`ex`给定的`extent`之中保持物理块的起始地址、`EXT4_PBLK_CMASK(sbi, ee_start)`为`ex`给定的`extent`之中保存逻辑块占用的第一个`cluster`，`c_offset`为`map`之中给定的逻辑块起始地址在`cluster`之中的偏移。`map`之中物理块长度保证物理块(由`map`之中物理块起始地址与长度确定)不会越过所在的`cluster`，代码之中使用`min(map->m_len, (unsigned) sbi->s_cluster_ratio - c_offset)`来保证这一点，接下来根据`map`之中保存的逻辑块起始地址、`ex`给定的`extent`之中保存的逻辑块起始地址的关系进一步调整`map`之中保存的物理块长度以保证`map`中保存的物理块未被占用：当`map`中给定的逻辑块起始地址小于`ex`给定的`extent`之中保存的逻辑块起始地址时，确保`map`之中保存的物理块长度最多为`cluster`之中这两个逻辑块起始地址对应的物理块(单个块)之间的的物理块个数；反之获取`ex`给定的`extent`之后的`extent`，`map`中给定的逻辑块起始地址与之后的`ex`给定的`extent`中保存的起始地址之间的物理块未被占用，确保`map`之中保存的物理块长度最多为这两个逻辑块起始地址对应的物理块(单个块)之间的物理块个数。
+
+### `ext4_ext_search_left`函数
+
+```c
+/*
+ * search the closest allocated block to the left for *logical
+ * and returns it at @logical + it's physical address at @phys
+ * if *logical is the smallest allocated block, the function
+ * returns 0 at @phys
+ * return value contains 0 (success) or error code
+ */
+static int ext4_ext_search_left(struct inode *inode,
+				struct ext4_ext_path *path,
+				ext4_lblk_t *logical, ext4_fsblk_t *phys)
+{
+	struct ext4_extent_idx *ix;
+	struct ext4_extent *ex;
+	int depth, ee_len;
+
+	if (unlikely(path == NULL)) {
+		EXT4_ERROR_INODE(inode, "path == NULL *logical %d!", *logical);
+		return -EFSCORRUPTED;
+	}
+	depth = path->p_depth;
+	*phys = 0;
+
+	if (depth == 0 && path->p_ext == NULL)
+		return 0;
+
+	/* usually extent in the path covers blocks smaller
+	 * then *logical, but it can be that extent is the
+	 * first one in the file */
+
+	ex = path[depth].p_ext;
+	ee_len = ext4_ext_get_actual_len(ex);
+	if (*logical < le32_to_cpu(ex->ee_block)) {
+		if (unlikely(EXT_FIRST_EXTENT(path[depth].p_hdr) != ex)) {
+			EXT4_ERROR_INODE(inode,
+					 "EXT_FIRST_EXTENT != ex *logical %d ee_block %d!",
+					 *logical, le32_to_cpu(ex->ee_block));
+			return -EFSCORRUPTED;
+		}
+		while (--depth >= 0) {
+			ix = path[depth].p_idx;
+			if (unlikely(ix != EXT_FIRST_INDEX(path[depth].p_hdr))) {
+				EXT4_ERROR_INODE(inode,
+				  "ix (%d) != EXT_FIRST_INDEX (%d) (depth %d)!",
+				  ix != NULL ? le32_to_cpu(ix->ei_block) : 0,
+				  le32_to_cpu(EXT_FIRST_INDEX(path[depth].p_hdr)->ei_block),
+				  depth);
+				return -EFSCORRUPTED;
+			}
+		}
+		return 0;
+	}
+
+	if (unlikely(*logical < (le32_to_cpu(ex->ee_block) + ee_len))) {
+		EXT4_ERROR_INODE(inode,
+				 "logical %d < ee_block %d + ee_len %d!",
+				 *logical, le32_to_cpu(ex->ee_block), ee_len);
+		return -EFSCORRUPTED;
+	}
+
+	*logical = le32_to_cpu(ex->ee_block) + ee_len - 1;
+	*phys = ext4_ext_pblock(ex) + ee_len - 1;
+	return 0;
+}
+```
+
+这个函数搜索在`*logic`给定逻辑块左侧并且距离最近的已分配逻辑块(单个块)以及这个逻辑块(单个块)对应的物理块，搜索到的逻辑块(单个块)通过`logical`参数返回、物理块通过`phys`参数返回。
+
+这个函数先进行基本的参数检查，当传入的`path`为空指针时直接返回错误码，当文件对应的B+树为空时设置返回的物理块为0并返回0，当`*logic`给定的逻辑块位于`ex`给定的`extent`保存的逻辑块范围之内时同样直接返回错误码。
+
+由于B+树中`extent`查找时通过二分搜索算法进行的，这个算法实现保证只要存在某个`extent`之中保存的逻辑块起始地址小于`*logical`给定的逻辑块起始地址就一定会返回这个`extent`，因此当`*logical`给定的逻辑块起始地址小于`ex`给定的`extent`之中保存的逻辑块起始地址时意味着`ex`给定的`extent`是文件对应的B+树中的第一个`extent`。此时`path`之中保存的每层索引或者`extent`在对应节点中的第一个位置，代码之中使用`EXT_FIRST_EXTENT`以及`EXT_FIRST_INDEX`来检测当前`path`是否存在不满足此要求的`extent`或者索引，若存在则返回错误码，反之返回0表示`*logical`给定的逻辑块起始地址是文件之中地址最小的逻辑块并且设置返回的逻辑块为0。
+
+当`ex`给定的`extent`不是B+树中第一个`extent`时，这个`extent`之中保存的逻辑块之中最后一个块就是在`*logical`给定的逻辑块起始地址之前并且最靠近它的已分配的逻辑块(单个块)。
+
+### `ext4_ext_search_right`函数
+
+```c
+/*
+ * Search the closest allocated block to the right for *logical
+ * and returns it at @logical + it's physical address at @phys.
+ * If not exists, return 0 and @phys is set to 0. We will return
+ * 1 which means we found an allocated block and ret_ex is valid.
+ * Or return a (< 0) error code.
+ */
+static int ext4_ext_search_right(struct inode *inode,
+				 struct ext4_ext_path *path,
+				 ext4_lblk_t *logical, ext4_fsblk_t *phys,
+				 struct ext4_extent *ret_ex)
+{
+	struct buffer_head *bh = NULL;
+	struct ext4_extent_header *eh;
+	struct ext4_extent_idx *ix;
+	struct ext4_extent *ex;
+	int depth;	/* Note, NOT eh_depth; depth from top of tree */
+	int ee_len;
+
+	if (unlikely(path == NULL)) {
+		EXT4_ERROR_INODE(inode, "path == NULL *logical %d!", *logical);
+		return -EFSCORRUPTED;
+	}
+	depth = path->p_depth;
+	*phys = 0;
+
+	if (depth == 0 && path->p_ext == NULL)
+		return 0;
+
+	/* usually extent in the path covers blocks smaller
+	 * then *logical, but it can be that extent is the
+	 * first one in the file */
+
+	ex = path[depth].p_ext;
+	ee_len = ext4_ext_get_actual_len(ex);
+	if (*logical < le32_to_cpu(ex->ee_block)) {
+		if (unlikely(EXT_FIRST_EXTENT(path[depth].p_hdr) != ex)) {
+			EXT4_ERROR_INODE(inode,
+					 "first_extent(path[%d].p_hdr) != ex",
+					 depth);
+			return -EFSCORRUPTED;
+		}
+		while (--depth >= 0) {
+			ix = path[depth].p_idx;
+			if (unlikely(ix != EXT_FIRST_INDEX(path[depth].p_hdr))) {
+				EXT4_ERROR_INODE(inode,
+						 "ix != EXT_FIRST_INDEX *logical %d!",
+						 *logical);
+				return -EFSCORRUPTED;
+			}
+		}
+		goto found_extent;
+	}
+
+	if (unlikely(*logical < (le32_to_cpu(ex->ee_block) + ee_len))) {
+		EXT4_ERROR_INODE(inode,
+				 "logical %d < ee_block %d + ee_len %d!",
+				 *logical, le32_to_cpu(ex->ee_block), ee_len);
+		return -EFSCORRUPTED;
+	}
+
+	if (ex != EXT_LAST_EXTENT(path[depth].p_hdr)) {
+		/* next allocated block in this leaf */
+		ex++;
+		goto found_extent;
+	}
+
+	/* go up and search for index to the right */
+	while (--depth >= 0) {
+		ix = path[depth].p_idx;
+		if (ix != EXT_LAST_INDEX(path[depth].p_hdr))
+			goto got_index;
+	}
+
+	/* we've gone up to the root and found no index to the right */
+	return 0;
+
+got_index:
+	/* we've found index to the right, let's
+	 * follow it and find the closest allocated
+	 * block to the right */
+	ix++;
+	while (++depth < path->p_depth) {
+		/* subtract from p_depth to get proper eh_depth */
+		bh = read_extent_tree_block(inode, ix, path->p_depth - depth, 0);
+		if (IS_ERR(bh))
+			return PTR_ERR(bh);
+		eh = ext_block_hdr(bh);
+		ix = EXT_FIRST_INDEX(eh);
+		put_bh(bh);
+	}
+
+	bh = read_extent_tree_block(inode, ix, path->p_depth - depth, 0);
+	if (IS_ERR(bh))
+		return PTR_ERR(bh);
+	eh = ext_block_hdr(bh);
+	ex = EXT_FIRST_EXTENT(eh);
+found_extent:
+	*logical = le32_to_cpu(ex->ee_block);
+	*phys = ext4_ext_pblock(ex);
+	if (ret_ex)
+		*ret_ex = *ex;
+	if (bh)
+		put_bh(bh);
+	return 1;
+}
+```
+
+这个函数搜索在`*logic`给定逻辑块右侧并且距离最近的已分配逻辑块(单个块)以及这个逻辑块(单个块)对应的物理块，搜索到的逻辑块(单个块)通过`logical`参数返回、物理块通过`phys`参数返回、搜索到的逻辑块(单个块)所在的`extent`通过`ret_ex`返回，这个函数的基本参数检查与`ext4_ext_search_left`函数的基本参数检查内容一致。
+
+当`ex`给定的`extent`对应文件之中第一个`extent`时处理逻辑与`ext4_ext_search_left`函数对应的处理逻辑相同，只不过这个函数是在搜索`*logical`给定逻辑块右侧的已经分配的逻辑块，这个`extent`之中保存的逻辑块起始地址正好是要搜索的已分配的逻辑块起始地址，跳转到标签`found_extent`处继续执行。这个函数之中文件中第一个`extent`的判断逻辑以及检查逻辑见`ext4_ext_search_right`函数对应的流程记录。
+
+当`ex`给定的`extent`不是其所在节点的最后一个`extent`时，它后边的`extent`之中保存的逻辑块起始地址即为搜索到的已经分配的逻辑块(单个块)地址，跳转到标签`found_extent`处继续执行；当`ex`给定的`extent`是所在节点的最后一个`extent`时，先找到`path`之中上层的之中第一个索引，然后跳转到标签`got_index`处继续执行，若`path`之中上层的所有索引都是所在节点的最后一个索引那么返回0表明为找到这样的逻辑块。
+
+标签`got_index`处的逻辑为从已经找到的索引开始沿着B+树向下层遍历直到找到叶子节点，把它当作待读取节点的索引，遍历过程中根据待读取节点的索引从磁盘中加载这层的索引节点、获取到节点之中第一个索引，把这个索引当作遍历下一层时使用的待读取节点的索引。找到叶子节点之后叶子节点之中的第一个`extent`之中保存的逻辑起始地址即为搜索到的已分配的逻辑块(单个块)的地址，将这个`extent`保存在`ex`之中。
+
+标签`found_extent`处的逻辑比较简单，`ex`给定了搜索到的逻辑块(单个块)所在的`extent`，那么更新`*logical`为这个`extent`之中保存的逻辑块起始地址，`*phys`之中保存逻辑地址对应的物理地址，返回1表示已经找到。
