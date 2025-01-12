@@ -841,8 +841,73 @@ found_extent:
 
 当`ex`给定的`extent`对应文件之中第一个`extent`时处理逻辑与`ext4_ext_search_left`函数对应的处理逻辑相同，只不过这个函数是在搜索`*logical`给定逻辑块右侧的已经分配的逻辑块，这个`extent`之中保存的逻辑块起始地址正好是要搜索的已分配的逻辑块起始地址，跳转到标签`found_extent`处继续执行。这个函数之中文件中第一个`extent`的判断逻辑以及检查逻辑见`ext4_ext_search_right`函数对应的流程记录。
 
-当`ex`给定的`extent`不是其所在节点的最后一个`extent`时，它后边的`extent`之中保存的逻辑块起始地址即为搜索到的已经分配的逻辑块(单个块)地址，跳转到标签`found_extent`处继续执行；当`ex`给定的`extent`是所在节点的最后一个`extent`时，先找到`path`之中上层的之中第一个索引，然后跳转到标签`got_index`处继续执行，若`path`之中上层的所有索引都是所在节点的最后一个索引那么返回0表明为找到这样的逻辑块。
+当`ex`给定的`extent`不是其所在节点的最后一个`extent`时，它后边的`extent`之中保存的逻辑块起始地址即为搜索到的已经分配的逻辑块(单个块)地址，跳转到标签`found_extent`处继续执行；当`ex`给定的`extent`是所在节点的最后一个`extent`时，搜索`path`之中上层中的索引，如找到一个索引不是所在节点的最后一个索引就跳转到标签`got_index`处继续执行，若`path`之中上层的所有索引都是所在节点的最后一个索引那么返回0表明为找到这样的逻辑块。
 
-标签`got_index`处的逻辑为从已经找到的索引开始沿着B+树向下层遍历直到找到叶子节点，把它当作待读取节点的索引，遍历过程中根据待读取节点的索引从磁盘中加载这层的索引节点、获取到节点之中第一个索引，把这个索引当作遍历下一层时使用的待读取节点的索引。找到叶子节点之后叶子节点之中的第一个`extent`之中保存的逻辑起始地址即为搜索到的已分配的逻辑块(单个块)的地址，将这个`extent`保存在`ex`之中。
+标签`got_index`处的逻辑为从找到的索引所在的节点之中位于下一个位置的索引开始，沿着B+树向下层遍历直到找到叶子节点，把它当作待读取节点的索引，遍历过程中根据待读取节点的索引从磁盘中加载这层的索引节点、获取到节点之中第一个索引，把这个索引当作遍历下一层时使用的待读取节点的索引。找到叶子节点之后叶子节点之中的第一个`extent`之中保存的逻辑起始地址即为搜索到的已分配的逻辑块(单个块)的地址，将这个`extent`保存在`ex`之中。
 
 标签`found_extent`处的逻辑比较简单，`ex`给定了搜索到的逻辑块(单个块)所在的`extent`，那么更新`*logical`为这个`extent`之中保存的逻辑块起始地址，`*phys`之中保存逻辑地址对应的物理地址，返回1表示已经找到。
+
+### `ext4_ext_check_overlap`函数
+
+```c
+/*
+ * check if a portion of the "newext" extent overlaps with an
+ * existing extent.
+ *
+ * If there is an overlap discovered, it updates the length of the newext
+ * such that there will be no overlap, and then returns 1.
+ * If there is no overlap found, it returns 0.
+ */
+static unsigned int ext4_ext_check_overlap(struct ext4_sb_info *sbi,
+					   struct inode *inode,
+					   struct ext4_extent *newext,
+					   struct ext4_ext_path *path)
+{
+	ext4_lblk_t b1, b2;
+	unsigned int depth, len1;
+	unsigned int ret = 0;
+
+	b1 = le32_to_cpu(newext->ee_block);
+	len1 = ext4_ext_get_actual_len(newext);
+	depth = ext_depth(inode);
+	if (!path[depth].p_ext)
+		goto out;
+	b2 = EXT4_LBLK_CMASK(sbi, le32_to_cpu(path[depth].p_ext->ee_block));
+
+	/*
+	 * get the next allocated block if the extent in the path
+	 * is before the requested block(s)
+	 */
+	if (b2 < b1) {
+		b2 = ext4_ext_next_allocated_block(path);
+		if (b2 == EXT_MAX_BLOCKS)
+			goto out;
+		b2 = EXT4_LBLK_CMASK(sbi, b2);
+	}
+
+	/* check for wrap through zero on extent logical start block*/
+	if (b1 + len1 < b1) {
+		len1 = EXT_MAX_BLOCKS - b1;
+		newext->ee_len = cpu_to_le16(len1);
+		ret = 1;
+	}
+
+	/* check for overlap */
+	if (b1 + len1 > b2) {
+		newext->ee_len = cpu_to_le16(b2 - b1);
+		ret = 1;
+	}
+out:
+	return ret;
+}
+```
+
+这个函数查找`newex`给定的逻辑块是否与一个已经创建的`extent`重叠，未发现重叠返回1，发现重叠时修改`newex`之中逻辑块长度使得逻辑块与已经创建的`extent`不再有重叠。函数中`b1`为`newex`指定的逻辑块起始地址、`len1`为逻辑块长度、`b2`为搜索到的`extent`之中保存的逻辑块所在`cluster`中的第一个逻辑块(单个块)的地址，这个函数的主要流程如下：
+
+1).若`newex`给定的逻辑块在搜索到的`extent`之前，通过`ext4_ext_next_allocated_block`获取到下一个`extent`之中保存的逻辑块起始地址并保存到`b2`之中，如果无法获取到则跳转到`out`向调用者返回0，获取到更新`b2`为所在`cluster`中的起始逻辑块(单个块)地址。只有在`newex`给定的逻辑块起始地址之后的`extent`与给定逻辑块之间才能出现可以分配的逻辑块，所以这种出现这种情况需要获取到搜索到的`extent`所在节点中下一个位置中的`extent`；
+
+2).若`newex`给定逻辑块结束地址计算过程中出现数值溢出，需要对逻辑块的长度进行调整，将逻辑块的长度调整为`ext4`文件系统在给定的逻辑块起始地址之后还能够容纳的最大的逻辑块数量，调整完成之后设置返回值为1；
+
+3).若`newex`给定的逻辑块的结束地址大于之后的`extent`所在`cluster`中的起始逻辑块(单个块)的地址，意味着给定的逻辑块与之后的`extent`所在的`cluster`有重叠，调整`newex`之中给定逻辑块的长度为给定逻辑块起始地址到`cluster`之中第一个逻辑块(单个块)起始地址之间可分配逻辑块个数，设置返回值为1。这里需要注意的是`b2`为`cluster`中起始逻辑块(单个块)的地址，这意味着调整之后`newex`给定逻辑块不能进入`b2`所属的`cluster`之中，这样是为了避免在后续流程分配`cluster`时占用的逻辑块与`b2`所属`cluster`发生冲突；
+
+4).标签`out`处的代码返回指定的返回值。
