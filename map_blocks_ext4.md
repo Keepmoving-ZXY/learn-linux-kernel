@@ -911,3 +911,118 @@ out:
 3).若`newex`给定的逻辑块的结束地址大于之后的`extent`所在`cluster`中的起始逻辑块(单个块)的地址，意味着给定的逻辑块与之后的`extent`所在的`cluster`有重叠，调整`newex`之中给定逻辑块的长度为给定逻辑块起始地址到`cluster`之中第一个逻辑块(单个块)起始地址之间可分配逻辑块个数，设置返回值为1。这里需要注意的是`b2`为`cluster`中起始逻辑块(单个块)的地址，这意味着调整之后`newex`给定逻辑块不能进入`b2`所属的`cluster`之中，这样是为了避免在后续流程分配`cluster`时占用的逻辑块与`b2`所属`cluster`发生冲突；
 
 4).标签`out`处的代码返回指定的返回值。
+
+### `ext4_ext_find_goal`函数
+
+```c
+static ext4_fsblk_t ext4_ext_find_goal(struct inode *inode,
+			      struct ext4_ext_path *path,
+			      ext4_lblk_t block)
+{
+	if (path) {
+		int depth = path->p_depth;
+		struct ext4_extent *ex;
+
+		/*
+		 * Try to predict block placement assuming that we are
+		 * filling in a file which will eventually be
+		 * non-sparse --- i.e., in the case of libbfd writing
+		 * an ELF object sections out-of-order but in a way
+		 * the eventually results in a contiguous object or
+		 * executable file, or some database extending a table
+		 * space file.  However, this is actually somewhat
+		 * non-ideal if we are writing a sparse file such as
+		 * qemu or KVM writing a raw image file that is going
+		 * to stay fairly sparse, since it will end up
+		 * fragmenting the file system's free space.  Maybe we
+		 * should have some hueristics or some way to allow
+		 * userspace to pass a hint to file system,
+		 * especially if the latter case turns out to be
+		 * common.
+		 */
+		ex = path[depth].p_ext;
+		if (ex) {
+			ext4_fsblk_t ext_pblk = ext4_ext_pblock(ex);
+			ext4_lblk_t ext_block = le32_to_cpu(ex->ee_block);
+
+			if (block > ext_block)
+				return ext_pblk + (block - ext_block);
+			else
+				return ext_pblk - (ext_block - block);
+		}
+
+		/* it looks like index is empty;
+		 * try to find starting block from index itself */
+		if (path[depth].p_bh)
+			return path[depth].p_bh->b_blocknr;
+	}
+
+	/* OK. use inode's group */
+	return ext4_inode_to_goal_block(inode);
+}
+```
+
+这个函数用于确定接下来分配`block`给定逻辑块对应物理块过程中搜索物理块使用的起始地址，主要分为以下几种情况：
+
+1).若之前的搜索过程中找到了一个`extent`，根据`block`给定的逻辑块起始地址与`extent`之中保存的逻辑块起始地址相对大小计算物理块起始地址并返回，代码之中`ext_pblk`为`extent`之中保存的物理块起始地址、`ext_block`为`extent`之中保存的逻辑块起始地址，两个逻辑块起始地址之间的差值也就是两个物理块起始地址之间的差值，通过这个差值可以由`extent`之中保存的物理块起始地址推测出`block`对应的物理块起始地址；
+
+2).若遍历过程中遍历到了索引但是没有找到对应的`extent`，返回这个索引所在的物理块(单个块)地址，在搜索某个逻辑块起始地址附近的`extent`时若出现逻辑块起始地址超出了当前`extent`映射的范围会出现遍历过程中找到了索引但是没有找到对应`extent`的情况；
+
+3).其他的情况下调用`ext4_inode_to_goal_block`函数使用inode所在的块组之中寻找一个物理块，例如当文件为空文件的时候`path`为空；
+
+### `ext4_inode_to_goal_block`函数
+
+```c
+/**
+ *	ext4_inode_to_goal_block - return a hint for block allocation
+ *	@inode: inode for block allocation
+ *
+ *	Return the ideal location to start allocating blocks for a
+ *	newly created inode.
+ */
+ext4_fsblk_t ext4_inode_to_goal_block(struct inode *inode)
+{
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	ext4_group_t block_group;
+	ext4_grpblk_t colour;
+	int flex_size = ext4_flex_bg_size(EXT4_SB(inode->i_sb));
+	ext4_fsblk_t bg_start;
+	ext4_fsblk_t last_block;
+
+	block_group = ei->i_block_group;
+	if (flex_size >= EXT4_FLEX_SIZE_DIR_ALLOC_SCHEME) {
+		/*
+		 * If there are at least EXT4_FLEX_SIZE_DIR_ALLOC_SCHEME
+		 * block groups per flexgroup, reserve the first block
+		 * group for directories and special files.  Regular
+		 * files will start at the second block group.  This
+		 * tends to speed up directory access and improves
+		 * fsck times.
+		 */
+		block_group &= ~(flex_size-1);
+		if (S_ISREG(inode->i_mode))
+			block_group++;
+	}
+	bg_start = ext4_group_first_block_no(inode->i_sb, block_group);
+	last_block = ext4_blocks_count(EXT4_SB(inode->i_sb)->s_es) - 1;
+
+	/*
+	 * If we are doing delayed allocation, we don't need take
+	 * colour into account.
+	 */
+	if (test_opt(inode->i_sb, DELALLOC))
+		return bg_start;
+
+	if (bg_start + EXT4_BLOCKS_PER_GROUP(inode->i_sb) <= last_block)
+		colour = (task_pid_nr(current) % 16) *
+			(EXT4_BLOCKS_PER_GROUP(inode->i_sb) / 16);
+	else
+		colour = (task_pid_nr(current) % 16) *
+			((last_block - bg_start) / 16);
+	return bg_start + colour;
+}
+```
+
+这个函数返回inode所在块组或者下一个块组中的一个物理块地址当作物理块分配时起始地址，`block_group`为inode所在的块组、`bg_start`为这个块组起始物理块(单个块)地址、`last_block`为文件系统中最后一个物理块(单个块)的地址，分区的大小会影响`last_block`的值。函数的主要流程如下：
+
+1).在`ext4`文件系统中`flex group`由多个块组组成，若`flex group`之中块的数量大于`EXT4_FLEX_SIZE_DIR_ALLOC_SCHEME`，inode所在的块组用于存储目录和特殊的文件、下一个块组用于分配普通文件，代码之中使用`block_group &= ~(flex_size-1)`将`block_group`设置为`flex group`的起始块组、通过`S_ISREG(inode->i_mode)`判断是否在分配普通文件使用的物理块；
