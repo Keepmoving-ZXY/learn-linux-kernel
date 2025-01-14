@@ -1025,4 +1025,167 @@ ext4_fsblk_t ext4_inode_to_goal_block(struct inode *inode)
 
 这个函数返回inode所在块组或者下一个块组中的一个物理块地址当作物理块分配时起始地址，`block_group`为inode所在的块组、`bg_start`为这个块组起始物理块(单个块)地址、`last_block`为文件系统中最后一个物理块(单个块)的地址，分区的大小会影响`last_block`的值。函数的主要流程如下：
 
-1).在`ext4`文件系统中`flex group`由多个块组组成，若`flex group`之中块的数量大于`EXT4_FLEX_SIZE_DIR_ALLOC_SCHEME`，inode所在的块组用于存储目录和特殊的文件、下一个块组用于分配普通文件，代码之中使用`block_group &= ~(flex_size-1)`将`block_group`设置为`flex group`的起始块组、通过`S_ISREG(inode->i_mode)`判断是否在分配普通文件使用的物理块；
+1).在`ext4`文件系统中`flex group`由多个块组组成，若`flex group`之中块的数量大于`EXT4_FLEX_SIZE_DIR_ALLOC_SCHEME`，inode所在的块组用于存储目录和特殊的文件、下一个块组用于分配普通文件，代码之中使用`block_group &= ~(flex_size-1)`将`block_group`设置为`flex group`的起始块组、通过`S_ISREG(inode->i_mode)`判断是否在分配普通文件使用的物理块，调整`block group`之后需要调整`bg_start`为`block group`给定的块组中起始物理块地址(单个块)；
+
+2).若正在进行的物理块分配为延迟分配，直接返回`block group`给定的块组中起始物理块(单个块)地址；
+
+3).若块组中结束物理块(单个块)没有超过文件系统的限制，返回的物理块(单个块)地址在快组中的偏移计算结合任务id以及块组之中物理块的个数；
+
+4)若块组中结束物理块(单个块)超过文件系统的限制，返回的物理块(单个块)地址在物理块中的偏移计算结合任务id以及块组中的可用物理块数量；
+
+### `ext4_mb_new_blocks`函数
+
+```c
+/*
+ * Main entry point into mballoc to allocate blocks
+ * it tries to use preallocation first, then falls back
+ * to usual allocation
+ */
+ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
+				struct ext4_allocation_request *ar, int *errp)
+{
+	struct ext4_allocation_context *ac = NULL;
+	struct ext4_sb_info *sbi;
+	struct super_block *sb;
+	ext4_fsblk_t block = 0;
+	unsigned int inquota = 0;
+	unsigned int reserv_clstrs = 0;
+	int retries = 0;
+	u64 seq;
+
+	might_sleep();
+	sb = ar->inode->i_sb;
+	sbi = EXT4_SB(sb);
+
+	trace_ext4_request_blocks(ar);
+	if (sbi->s_mount_state & EXT4_FC_REPLAY)
+		return ext4_mb_new_blocks_simple(ar, errp);
+
+	/* Allow to use superuser reservation for quota file */
+	if (ext4_is_quota_file(ar->inode))
+		ar->flags |= EXT4_MB_USE_ROOT_BLOCKS;
+
+	if ((ar->flags & EXT4_MB_DELALLOC_RESERVED) == 0) {
+		/* Without delayed allocation we need to verify
+		 * there is enough free blocks to do block allocation
+		 * and verify allocation doesn't exceed the quota limits.
+		 */
+		while (ar->len &&
+			ext4_claim_free_clusters(sbi, ar->len, ar->flags)) {
+
+			/* let others to free the space */
+			cond_resched();
+			ar->len = ar->len >> 1;
+		}
+		if (!ar->len) {
+			ext4_mb_show_pa(sb);
+			*errp = -ENOSPC;
+			return 0;
+		}
+		reserv_clstrs = ar->len;
+		if (ar->flags & EXT4_MB_USE_ROOT_BLOCKS) {
+			dquot_alloc_block_nofail(ar->inode,
+						 EXT4_C2B(sbi, ar->len));
+		} else {
+			while (ar->len &&
+				dquot_alloc_block(ar->inode,
+						  EXT4_C2B(sbi, ar->len))) {
+
+				ar->flags |= EXT4_MB_HINT_NOPREALLOC;
+				ar->len--;
+			}
+		}
+		inquota = ar->len;
+		if (ar->len == 0) {
+			*errp = -EDQUOT;
+			goto out;
+		}
+	}
+
+	ac = kmem_cache_zalloc(ext4_ac_cachep, GFP_NOFS);
+	if (!ac) {
+		ar->len = 0;
+		*errp = -ENOMEM;
+		goto out;
+	}
+
+	*errp = ext4_mb_initialize_context(ac, ar);
+	if (*errp) {
+		ar->len = 0;
+		goto out;
+	}
+
+	ac->ac_op = EXT4_MB_HISTORY_PREALLOC;
+	seq = this_cpu_read(discard_pa_seq);
+	if (!ext4_mb_use_preallocated(ac)) {
+		ac->ac_op = EXT4_MB_HISTORY_ALLOC;
+		ext4_mb_normalize_request(ac, ar);
+
+		*errp = ext4_mb_pa_alloc(ac);
+		if (*errp)
+			goto errout;
+repeat:
+		/* allocate space in core */
+		*errp = ext4_mb_regular_allocator(ac);
+		/*
+		 * pa allocated above is added to grp->bb_prealloc_list only
+		 * when we were able to allocate some block i.e. when
+		 * ac->ac_status == AC_STATUS_FOUND.
+		 * And error from above mean ac->ac_status != AC_STATUS_FOUND
+		 * So we have to free this pa here itself.
+		 */
+		if (*errp) {
+			ext4_mb_pa_free(ac);
+			ext4_discard_allocated_blocks(ac);
+			goto errout;
+		}
+		if (ac->ac_status == AC_STATUS_FOUND &&
+			ac->ac_o_ex.fe_len >= ac->ac_f_ex.fe_len)
+			ext4_mb_pa_free(ac);
+	}
+	if (likely(ac->ac_status == AC_STATUS_FOUND)) {
+		*errp = ext4_mb_mark_diskspace_used(ac, handle, reserv_clstrs);
+		if (*errp) {
+			ext4_discard_allocated_blocks(ac);
+			goto errout;
+		} else {
+			block = ext4_grp_offs_to_block(sb, &ac->ac_b_ex);
+			ar->len = ac->ac_b_ex.fe_len;
+		}
+	} else {
+		if (++retries < 3 &&
+		    ext4_mb_discard_preallocations_should_retry(sb, ac, &seq))
+			goto repeat;
+		/*
+		 * If block allocation fails then the pa allocated above
+		 * needs to be freed here itself.
+		 */
+		ext4_mb_pa_free(ac);
+		*errp = -ENOSPC;
+	}
+
+errout:
+	if (*errp) {
+		ac->ac_b_ex.fe_len = 0;
+		ar->len = 0;
+		ext4_mb_show_ac(ac);
+	}
+	ext4_mb_release_context(ac);
+out:
+	if (ac)
+		kmem_cache_free(ext4_ac_cachep, ac);
+	if (inquota && ar->len < inquota)
+		dquot_free_block(ar->inode, EXT4_C2B(sbi, inquota - ar->len));
+	if (!ar->len) {
+		if ((ar->flags & EXT4_MB_DELALLOC_RESERVED) == 0)
+			/* release all the reserved blocks if non delalloc */
+			percpu_counter_sub(&sbi->s_dirtyclusters_counter,
+						reserv_clstrs);
+	}
+
+	trace_ext4_allocate_blocks(ar, (unsigned long long)block);
+
+	return block;
+}
+```
+
