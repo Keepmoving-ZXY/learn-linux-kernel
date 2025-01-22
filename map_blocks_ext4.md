@@ -1214,3 +1214,225 @@ out:
 
 此部分代码释放分配过程中创建的上下文，若实际分配的`cluster`数量小于`inquota`之中保存的数量需要从配额之中减去少分配的`cluster`对应的物理块数量，返回分配到的物理块起始地址。
 
+### `ext4_mb_regular_allocator` 函数
+
+```c
+static noinline_for_stack int
+ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
+{
+	ext4_group_t prefetch_grp = 0, ngroups, group, i;
+	int cr = -1, new_cr;
+	int err = 0, first_err = 0;
+	unsigned int nr = 0, prefetch_ios = 0;
+	struct ext4_sb_info *sbi;
+	struct super_block *sb;
+	struct ext4_buddy e4b;
+	int lost;
+
+	sb = ac->ac_sb;
+	sbi = EXT4_SB(sb);
+	ngroups = ext4_get_groups_count(sb);
+	/* non-extent files are limited to low blocks/groups */
+	if (!(ext4_test_inode_flag(ac->ac_inode, EXT4_INODE_EXTENTS)))
+		ngroups = sbi->s_blockfile_groups;
+
+	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
+
+	/* first, try the goal */
+	err = ext4_mb_find_by_goal(ac, &e4b);
+	if (err || ac->ac_status == AC_STATUS_FOUND)
+		goto out;
+
+	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
+		goto out;
+
+	/*
+	 * ac->ac_2order is set only if the fe_len is a power of 2
+	 * if ac->ac_2order is set we also set criteria to 0 so that we
+	 * try exact allocation using buddy.
+	 */
+	i = fls(ac->ac_g_ex.fe_len);
+	ac->ac_2order = 0;
+	/*
+	 * We search using buddy data only if the order of the request
+	 * is greater than equal to the sbi_s_mb_order2_reqs
+	 * You can tune it via /sys/fs/ext4/<partition>/mb_order2_req
+	 * We also support searching for power-of-two requests only for
+	 * requests upto maximum buddy size we have constructed.
+	 */
+	if (i >= sbi->s_mb_order2_reqs && i <= MB_NUM_ORDERS(sb)) {
+		/*
+		 * This should tell if fe_len is exactly power of 2
+		 */
+		if ((ac->ac_g_ex.fe_len & (~(1 << (i - 1)))) == 0)
+			ac->ac_2order = array_index_nospec(i - 1,
+							   MB_NUM_ORDERS(sb));
+	}
+
+	/* if stream allocation is enabled, use global goal */
+	if (ac->ac_flags & EXT4_MB_STREAM_ALLOC) {
+		/* TBD: may be hot point */
+		spin_lock(&sbi->s_md_lock);
+		ac->ac_g_ex.fe_group = sbi->s_mb_last_group;
+		ac->ac_g_ex.fe_start = sbi->s_mb_last_start;
+		spin_unlock(&sbi->s_md_lock);
+	}
+
+	/* Let's just scan groups to find more-less suitable blocks */
+	cr = ac->ac_2order ? 0 : 1;
+	/*
+	 * cr == 0 try to get exact allocation,
+	 * cr == 3  try to get anything
+	 */
+repeat:
+	for (; cr < 4 && ac->ac_status == AC_STATUS_CONTINUE; cr++) {
+		ac->ac_criteria = cr;
+		/*
+		 * searching for the right group start
+		 * from the goal value specified
+		 */
+		group = ac->ac_g_ex.fe_group;
+		ac->ac_groups_linear_remaining = sbi->s_mb_max_linear_groups;
+		prefetch_grp = group;
+
+		for (i = 0, new_cr = cr; i < ngroups; i++,
+		     ext4_mb_choose_next_group(ac, &new_cr, &group, ngroups)) {
+			int ret = 0;
+
+			cond_resched();
+			if (new_cr != cr) {
+				cr = new_cr;
+				goto repeat;
+			}
+
+			/*
+			 * Batch reads of the block allocation bitmaps
+			 * to get multiple READs in flight; limit
+			 * prefetching at cr=0/1, otherwise mballoc can
+			 * spend a lot of time loading imperfect groups
+			 */
+			if ((prefetch_grp == group) &&
+			    (cr > 1 ||
+			     prefetch_ios < sbi->s_mb_prefetch_limit)) {
+				unsigned int curr_ios = prefetch_ios;
+
+				nr = sbi->s_mb_prefetch;
+				if (ext4_has_feature_flex_bg(sb)) {
+					nr = 1 << sbi->s_log_groups_per_flex;
+					nr -= group & (nr - 1);
+					nr = min(nr, sbi->s_mb_prefetch);
+				}
+				prefetch_grp = ext4_mb_prefetch(sb, group,
+							nr, &prefetch_ios);
+				if (prefetch_ios == curr_ios)
+					nr = 0;
+			}
+
+			/* This now checks without needing the buddy page */
+			ret = ext4_mb_good_group_nolock(ac, group, cr);
+			if (ret <= 0) {
+				if (!first_err)
+					first_err = ret;
+				continue;
+			}
+
+			err = ext4_mb_load_buddy(sb, group, &e4b);
+			if (err)
+				goto out;
+
+			ext4_lock_group(sb, group);
+
+			/*
+			 * We need to check again after locking the
+			 * block group
+			 */
+			ret = ext4_mb_good_group(ac, group, cr);
+			if (ret == 0) {
+				ext4_unlock_group(sb, group);
+				ext4_mb_unload_buddy(&e4b);
+				continue;
+			}
+
+			ac->ac_groups_scanned++;
+			if (cr == 0)
+				ext4_mb_simple_scan_group(ac, &e4b);
+			else if (cr == 1 && sbi->s_stripe &&
+					!(ac->ac_g_ex.fe_len % sbi->s_stripe))
+				ext4_mb_scan_aligned(ac, &e4b);
+			else
+				ext4_mb_complex_scan_group(ac, &e4b);
+
+			ext4_unlock_group(sb, group);
+			ext4_mb_unload_buddy(&e4b);
+
+			if (ac->ac_status != AC_STATUS_CONTINUE)
+				break;
+		}
+		/* Processed all groups and haven't found blocks */
+		if (sbi->s_mb_stats && i == ngroups)
+			atomic64_inc(&sbi->s_bal_cX_failed[cr]);
+	}
+
+	if (ac->ac_b_ex.fe_len > 0 && ac->ac_status != AC_STATUS_FOUND &&
+	    !(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
+		/*
+		 * We've been searching too long. Let's try to allocate
+		 * the best chunk we've found so far
+		 */
+		ext4_mb_try_best_found(ac, &e4b);
+		if (ac->ac_status != AC_STATUS_FOUND) {
+			/*
+			 * Someone more lucky has already allocated it.
+			 * The only thing we can do is just take first
+			 * found block(s)
+			 */
+			lost = atomic_inc_return(&sbi->s_mb_lost_chunks);
+			mb_debug(sb, "lost chunk, group: %u, start: %d, len: %d, lost: %d\n",
+				 ac->ac_b_ex.fe_group, ac->ac_b_ex.fe_start,
+				 ac->ac_b_ex.fe_len, lost);
+
+			ac->ac_b_ex.fe_group = 0;
+			ac->ac_b_ex.fe_start = 0;
+			ac->ac_b_ex.fe_len = 0;
+			ac->ac_status = AC_STATUS_CONTINUE;
+			ac->ac_flags |= EXT4_MB_HINT_FIRST;
+			cr = 3;
+			goto repeat;
+		}
+	}
+
+	if (sbi->s_mb_stats && ac->ac_status == AC_STATUS_FOUND)
+		atomic64_inc(&sbi->s_bal_cX_hits[ac->ac_criteria]);
+out:
+	if (!err && ac->ac_status != AC_STATUS_FOUND && first_err)
+		err = first_err;
+
+	mb_debug(sb, "Best len %d, origin len %d, ac_status %u, ac_flags 0x%x, cr %d ret %d\n",
+		 ac->ac_b_ex.fe_len, ac->ac_o_ex.fe_len, ac->ac_status,
+		 ac->ac_flags, cr, err);
+
+	if (nr)
+		ext4_mb_prefetch_fini(sb, prefetch_grp, nr);
+
+	return err;
+}
+```
+
+这个函数是`ext4`文件系统中物理块分配的入口，物理块分配所需的信息在之前的流程中都已经存放到分配上下文`ac`之中了，函数的流程如下：
+
+#### 从指定位置分配
+
+尝试从指定的物理块(单个块)开始搜索物理块物理块，对应的函数为`ext4_mb_find_by_goal`，这个函数找到了符合要求的物理块意味着分配成功。
+
+#### 设置伙伴算法参数
+
+如果待分配物理块数量为2的幂并且幂值在指定的范围之内，设置`ac->ac_2order`为这个幂值，幂值的范围由两个值确定：`s_mb_order2_reqs`是启动伙伴算法的阈值，`MB_NUM_ORDERS(sb)`返回伙伴算法能够支持的最大幂值。代码中使用的`array_index_nospec`与现代cpu的推测执行机制有关，在推测执行期间可能会跳过条件判断直接进行数组访问，此时推测得到的数组下表可能会超过数组边界，需要通过生成掩码来限制数组下标不超过数组边界，这里使用`array_index_nospec`来限制在推测执行时`i-1`的值不超过`MB_NUM_ORDERS(sb)`。
+
+#### 设置流式分配参数
+
+如果使用流式分配，设置物理块搜索的起始地址，起始地址由上一次流式得到的物理块所在块组以及组内偏移组成，`sbi->s_mb_last_group`为上一次流式分配的物理块所在块组、`sbi->s_mb_last_start`为这个物理块在快组内的偏移。
+
+#### 块分配
+
+
+
