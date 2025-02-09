@@ -1204,11 +1204,11 @@ out:
 此部分代码流程如下：
 1).创建物理块分配上下文然后进行初始化，初始化过程在对待分配物理块数量超过块组中物理块数量时对待分配物理块数量进行修正、计算搜索起始物理块所在的块组以及块组内的偏移、确定分配策略(使用块组分配还是使用流式分配，流式分配尝试尽量为文件分配连续的物理块)；
 
-2).若分配过程中无法使用预分配的物理块，对待分配的物理块起始地址和物理块数量进行规范化以满足地址对齐、预分配等要求，创建用于预分配机制的`struct ext4_prealloc_space`实例、尝试按照分配请求`ac`之中给定的物理块起始地址和物理块数量分配物理块(对应`ext4_mb_regular_allocator`函数调用，这个函数调用的位置也是标签`repeat`所在位置)，若分配过程中出现错误，释放为预分配机制创建的实例、释放分配过程中已经分配的物理块，跳转到`errout`处继续执行；
+2).若分配过程中无法使用预分配的物理块，调用`ext4_mb_normalize_request`函数对待分配的物理块起始地址和物理块数量进行规范化以满足地址对齐、预分配等要求，这个函数确定并填充待分配的物理块所在块组以及块组内`cluster`的偏移至`ac->ac_g_ex.fe_group`和`ac->ac_g_ex.fe_start`之中，创建用于预分配机制的`struct ext4_prealloc_space`实例、尝试按照分配请求`ac`之中给定的物理块起始地址和物理块数量分配物理块(对应`ext4_mb_regular_allocator`函数调用，这个函数调用的位置也是标签`repeat`所在位置)，若分配过程中出现错误，释放为预分配机制创建的实例、释放分配过程中已经分配的物理块，跳转到`errout`处继续执行；
 
 3).当分配过程中可以使用预分配的物理块或者分配物理块过程中没有出现错误，需要考虑分配过程中是否找到了符合分配需求的物理块：若找到了已经满足分配需求的物理块，释放为预分配机制创建的实例，标记已分配的物理块为已使用状态、更新组描述符、全局计数器等元数据，获取分配得到物理块的起始地址以及分配得到的物理块数量；若未找到满足分配需求的物理块，最多进行三次物理块分配，每次重试前先释放预分配的物理块并且判断是否需要继续进行重试，若可以进行重试跳转到标签`repeat`处执行。若重试三次之后也无法找到满足分配需求的物理块，释放为预分配机制创建的实例，设置错误码；
 
-这部分代码涉及到了许多关键函数，`ext4_mb_use_preallocated`函数用于确定是否可以使用预分配的物理块、`ext4_mb_normalize_request`用于对分配请求进行正则化、`ext4_mb_regular_allocator`函数用于进行物理块分配、`ext4_mb_mark_diskspace_used`用于标记已经分配的物理块，在后边记录这些函数的流程。
+这部分代码涉及到了许多关键函数，`ext4_mb_use_preallocated`函数用于确定是否可以使用预分配的物理块、`ext4_mb_normalize_request`用于对分配请求进行规范化、`ext4_mb_regular_allocator`函数用于进行物理块分配、`ext4_mb_mark_diskspace_used`用于标记已经分配的物理块，在后边记录这些函数的流程。
 
 #### 标签`errout`和`out`
 
@@ -1454,10 +1454,80 @@ out:
 
 6).使用`cr`指定的搜索策略从`group`给定的块组之中搜索可用的物理块，`cr`的值由外层循环修改，不同的`cr`值意味着使用不同的搜索策略；
 
-7).释放块组锁以及伙伴信息，内存循环至此结束；
+7).释放块组锁以及伙伴信息，内层循环至此结束；
 
 两层`for`循环结束之后，如果搜索物理块是否消耗了比较长的时间，就需要先分配那些已经扫描到的物理块(使用`ext4_mb_try_best_found`函数)，若分配之后依然没有满足分配需求则清空分配上下文`ac`之中扫描到的物理块信息、设置优先使用扫描到的第一个物理块(这个物理块一定是距离`goal`给定的物理块(单个块)最近的)标记、设置`cr`为3以表明使用复杂的搜索策略，跳转到标签`repeat`处继续执行，也即空闲物理块搜索代码逻辑开始的位置。搜索物理块消耗比较长时间成立的条件为已经找到了部分物理块但还未满足分配需求、没有设置优先使用扫描到的第一个物理块标记。
 
 #### 返回分配结果
 
 若在空闲物理块搜索过程中发生了块组位图的预取操作，调用`ext4_mb_prefetch_fini`函数进行块组位图预取的收尾工作(例如伙伴位图初始化等)。最后返回0意味着分配成功，其他的值意味着分配失败、返回值自身为对应的错误码。
+
+### `ext4_mb_find_by_goal`函数
+
+```c
+static noinline_for_stack
+int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
+				struct ext4_buddy *e4b)
+{
+	ext4_group_t group = ac->ac_g_ex.fe_group;
+	int max;
+	int err;
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	struct ext4_group_info *grp = ext4_get_group_info(ac->ac_sb, group);
+	struct ext4_free_extent ex;
+
+	if (!grp)
+		return -EFSCORRUPTED;
+	if (!(ac->ac_flags & (EXT4_MB_HINT_TRY_GOAL | EXT4_MB_HINT_GOAL_ONLY)))
+		return 0;
+	if (grp->bb_free == 0)
+		return 0;
+
+	err = ext4_mb_load_buddy(ac->ac_sb, group, e4b);
+	if (err)
+		return err;
+
+	ext4_lock_group(ac->ac_sb, group);
+	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(e4b->bd_info)))
+		goto out;
+
+	max = mb_find_extent(e4b, ac->ac_g_ex.fe_start,
+			     ac->ac_g_ex.fe_len, &ex);
+	ex.fe_logical = 0xDEADFA11; /* debug value */
+
+	if (max >= ac->ac_g_ex.fe_len && ac->ac_g_ex.fe_len == sbi->s_stripe) {
+		ext4_fsblk_t start;
+
+		start = ext4_grp_offs_to_block(ac->ac_sb, &ex);
+		/* use do_div to get remainder (would be 64-bit modulo) */
+		if (do_div(start, sbi->s_stripe) == 0) {
+			ac->ac_found++;
+			ac->ac_b_ex = ex;
+			ext4_mb_use_best_found(ac, e4b);
+		}
+	} else if (max >= ac->ac_g_ex.fe_len) {
+		BUG_ON(ex.fe_len <= 0);
+		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
+		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
+		ac->ac_found++;
+		ac->ac_b_ex = ex;
+		ext4_mb_use_best_found(ac, e4b);
+	} else if (max > 0 && (ac->ac_flags & EXT4_MB_HINT_MERGE)) {
+		/* Sometimes, caller may want to merge even small
+		 * number of blocks to an existing extent */
+		BUG_ON(ex.fe_len <= 0);
+		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
+		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
+		ac->ac_found++;
+		ac->ac_b_ex = ex;
+		ext4_mb_use_best_found(ac, e4b);
+	}
+out:
+	ext4_unlock_group(ac->ac_sb, group);
+	ext4_mb_unload_buddy(e4b);
+
+	return 0;
+}
+```
+
+这个函数从`ac`中给定的块组内某个`cluster`处开始寻找空闲物理块，使用`ext4_mb_load_buddy`加载块组的伙伴信息之后，使用`mb_find_extent`函数搜索给定块组内某个`cluster`附近的空闲物理块写入到`ex`之中并返回找到的空闲物理块长度，`mb_find_extent`函数找到的空闲物理块长度可能无法满足分配需求，需要对`mb_find_extent`函数的返回值进行判断，代码之中`max`保存的就是搜索到的空闲物理块长度。
